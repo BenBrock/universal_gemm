@@ -77,11 +77,13 @@ def main():
         torch.cuda.synchronize()
 
     nvshmem.barrier_all(stream=stream)
+    torch.cuda.synchronize()
 
     if rank == 0:
         print(dt_a.to_local())
 
     nvshmem.barrier_all(stream=stream)
+    torch.cuda.synchronize()
 
     nvshmem.free_tensor(dt_a.nvshmem_base())
     nvshmem.free_tensor(local_a);
