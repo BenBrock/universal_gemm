@@ -14,6 +14,10 @@ def main():
     # Init pytorch.dist
     dist.init_process_group(backend='nccl')
 
+    assert os.environ.get("TORCH_DTENSOR_USE_NVSHMEM", "0") == "1", (
+        "Expected TORCH_DTENSOR_USE_NVSHMEM=1 for this example."
+    )
+
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
@@ -44,7 +48,7 @@ def main():
         nranks=world_size,
         initializer_method="uid",
     )
-
+    stream = nvshmem.NvshmemStream(torch.cuda.current_stream())
 
     m = 64
     n = 64
@@ -58,46 +62,28 @@ def main():
 
     dt_a = distribute_tensor(global_a, *a_p)
 
-    # Allocate local shard via NVSHMEM so we can use nvshmem4py peer tensors.
-    local_a = nvshmem.tensor((m, k), dtype=torch.float32)
+    # Allocate a symmetric buffer matching the local shard size.
+    local_shape = dt_a.to_local().shape
+    local_a = nvshmem.tensor(local_shape, dtype=torch.float32)
 
     local_a.fill_(42)
 
-    nvshmem.free_tensor(dt_a.nvshmem_base())
-    nvshmem.free_tensor(local_a);
-    nvshmem.finalize()
-    dist.destroy_process_group()
-    return
+    remote_base = dt_a.nvshmem_base()
+    nvshmem.barrier_all(stream=stream)
+    torch.cuda.synchronize()
+    if rank == 1:
+        nvshmem.put(remote_base, local_a, 0, stream=stream)
+        nvshmem.quiet(stream=stream)
+        torch.cuda.synchronize()
+
+    nvshmem.barrier_all(stream=stream)
 
     if rank == 0:
-        lt = local_a
-        print(lt)
-        print(lt.device, lt.dtype, lt.shape, lt.storage().data_ptr())
+        print(dt_a.to_local())
 
-        lt.fill_(42.0)
-        torch.cuda.synchronize()
-        nvshmem_stream = nvshmem.NvshmemStream(torch.cuda.current_stream())
-        for peer in range(world_size):
-            if peer == rank:
-                continue
-            peer_tensor = nvshmem.get_peer_tensor(lt, peer)
-            # Explicit NVSHMEM put to write into the remote tensor.
-            nvshmem.put(peer_tensor, lt, peer, stream=nvshmem_stream)
-        nvshmem.quiet(stream=nvshmem_stream)
-        torch.cuda.current_stream().synchronize()
+    nvshmem.barrier_all(stream=stream)
 
-        if hasattr(nvshmem, "barrier_all"):
-            nvshmem.barrier_all(stream=nvshmem_stream)
-        elif hasattr(nvshmem, "barrier"):
-            nvshmem.barrier(nvshmem.Teams.TEAM_WORLD, stream=nvshmem_stream)
-
-    dist.barrier()
-    if rank != 0:
-        lt = local_a
-        print(f"Rank {rank} local tensor after put: {lt.flatten()[:4].tolist()}")
-
-    dist.barrier()
-
+    nvshmem.free_tensor(dt_a.nvshmem_base())
     nvshmem.free_tensor(local_a);
     nvshmem.finalize()
     dist.destroy_process_group()
