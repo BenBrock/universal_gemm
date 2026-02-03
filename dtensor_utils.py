@@ -82,7 +82,7 @@ def _unflatten_index(index: int, sizes: list[int]) -> list[int]:
     return coords
 
 
-def _tile_owner_rank(dt: DTensor, coord: tuple[int, int]) -> int:
+def tile_rank(dt: DTensor, coord: tuple[int, int]) -> int:
     placements = dt.placements
     mesh = dt.device_mesh
 
@@ -153,7 +153,7 @@ def get_tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:
 
     max_shape = tile_shape(dt)
     actual_shape = tile_shape(dt, coord)
-    owner_rank = _tile_owner_rank(dt, coord)
+    owner_rank = tile_rank(dt, coord)
 
     local_buf = torch.empty(
         max_shape, dtype=dt.dtype, device=dt.device  # type: ignore[arg-type]
@@ -168,3 +168,23 @@ def get_tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:
 
     rows, cols = actual_shape
     return local_buf[:rows, :cols]
+
+
+def tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:
+    """
+    Return a local view of the tile if owned by the calling rank.
+    Raises if the tile is remote.
+    """
+    if dt.ndim != 2:
+        raise ValueError(f"tile expects a 2D DTensor, got ndim={dt.ndim}")
+
+    owner_rank = tile_rank(dt, coord)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if owner_rank != rank:
+        raise RuntimeError(
+            f"tile {coord} is owned by rank {owner_rank}, current rank is {rank}"
+        )
+
+    rows, cols = tile_shape(dt, coord)
+    local = dt.to_local()
+    return local[:rows, :cols]
