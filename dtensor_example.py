@@ -81,7 +81,21 @@ def main():
         grid_a = dtensor_utils.grid_shape(dt_a)
         for i in range(grid_a[0]):
             for j in range(grid_a[1]):
-                print(f"dt_a tile ({i}, {j}) shape: {dtensor_utils.tile_shape(dt_a, (i, j))}")
+                print(
+                    f"dt_a tile ({i}, {j}) shape: {dtensor_utils.tile_shape(dt_a, (i, j))}"
+                )
+        for i in range(grid_a[0]):
+            for j in range(grid_a[1]):
+                print(f"fetching tile ({i}, {j})", flush=True)
+                tile = dtensor_utils.get_tile(dt_a, (i, j))
+                print(f"fetched tile ({i}, {j}): dim {tile.shape}", flush=True)
+                expected_shape = dtensor_utils.tile_shape(dt_a, (i, j))
+                assert tuple(tile.shape) == expected_shape, (
+                    f"tile {i, j} shape {tuple(tile.shape)} != {expected_shape}"
+                )
+                print(f"dt_a tile ({i}, {j}) data:\n{tile.cpu()}")
+
+    dist.barrier()
 
     dt_c = torch.matmul(dt_a, dt_b)
 
