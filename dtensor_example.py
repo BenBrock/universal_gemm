@@ -4,9 +4,11 @@ import os
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
 
 import benchmark.util
+import dtensor_mm_handler
+import dtensor_utils
 import nvshmem.core as nvshmem
 from cuda.core.experimental import Device
 
@@ -50,43 +52,51 @@ def main():
     )
     stream = nvshmem.NvshmemStream(torch.cuda.current_stream())
 
-    m = 64
+    dtensor_mm_handler.enable()
+
+    m = 63
     n = 64
     k = 64
+
+    '''
+    NOTE: I *think* things should work for uneven tile sizes?
     assert m % world_size == 0, "m must be divisible by world_size for even row sharding"
     assert k % world_size == 0, "k must be divisible by world_size for even row sharding"
+    '''
 
     a_p = benchmark.util.row_partitioning()
+    b_p = benchmark.util.column_partitioning()
+
+    print(a_p)
 
     global_a = torch.randn(m, k, dtype=torch.float32)
+    global_b = torch.randn(k, n, dtype=torch.float32)
 
     dt_a = distribute_tensor(global_a, *a_p)
-
-    # Allocate a symmetric buffer matching the local shard size.
-    local_shape = dt_a.to_local().shape
-    local_a = nvshmem.tensor(local_shape, dtype=torch.float32)
-
-    local_a.fill_(42)
-
-    remote_base = dt_a.nvshmem_base()
-    nvshmem.barrier_all(stream=stream)
-    torch.cuda.synchronize()
-    if rank == 1:
-        nvshmem.put(remote_base, local_a, 0, stream=stream)
-        nvshmem.quiet(stream=stream)
-        torch.cuda.synchronize()
-
-    nvshmem.barrier_all(stream=stream)
-    torch.cuda.synchronize()
+    dt_b = distribute_tensor(global_b, *b_p)
 
     if rank == 0:
-        print(dt_a.to_local())
+        print(f"dt_a grid: {dtensor_utils.grid_shape(dt_a)}")
+        print(f"dt_b grid: {dtensor_utils.grid_shape(dt_b)}")
+        grid_a = dtensor_utils.grid_shape(dt_a)
+        for i in range(grid_a[0]):
+            for j in range(grid_a[1]):
+                print(f"dt_a tile ({i}, {j}) shape: {dtensor_utils.tile_shape(dt_a, (i, j))}")
 
-    nvshmem.barrier_all(stream=stream)
-    torch.cuda.synchronize()
+    dt_c = torch.matmul(dt_a, dt_b)
+
+    global_c = torch.matmul(global_a, global_b)
+    full_c = dt_c.full_tensor()
+    if rank == 0:
+        torch.testing.assert_close(
+            full_c.cpu(),
+            global_c.cpu(),
+            rtol=1e-4,
+            atol=1e-5,
+        )
 
     nvshmem.free_tensor(dt_a.nvshmem_base())
-    nvshmem.free_tensor(local_a);
+    nvshmem.free_tensor(dt_b.nvshmem_base())
     nvshmem.finalize()
     dist.destroy_process_group()
 
