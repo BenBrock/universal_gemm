@@ -77,10 +77,10 @@ def main():
     dt_c = distribute_tensor(global_c, *c_p)
 
     dist.barrier()
-    torch.matmul(dt_a, dt_b, out=dt_c)
+    torch.addmm(dt_c, dt_a, dt_b, out=dt_c)
     dist.barrier()
 
-    torch.matmul(global_a, global_b, out=global_c)
+    torch.addmm(global_c, global_a, global_b, out=global_c)
     full_c = dt_c.full_tensor()
     if rank == 0:
         torch.testing.assert_close(

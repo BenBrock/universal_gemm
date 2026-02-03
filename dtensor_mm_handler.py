@@ -24,20 +24,30 @@ def _row_partitioned_matmul(a: DTensor, b: DTensor, c: DTensor):
 
                 a_view = a_tile[:,k*tile_shape[0]:(k+1)*tile_shape[0]]
 
-                torch.addmm(c_tile, a_view, b_tile, beta=1.0, alpha=1.0, out=c_tile)
+                torch.addmm(c_tile, a_view, b_tile, out=c_tile)
 
 
-def _mm_out_handler(
+def _addmm_out_handler(
     op_call: torch._ops.OpOverload,
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> object:
-    a, b = args[0], args[1]
-    c = kwargs.get("out", args[2] if len(args) > 2 else None)
+    # We are computing c = ab + e
+    e, a, b = args[0], args[1], args[2]
+    c = kwargs.get("out")
+    if c is not e:
+        raise RuntimeError(
+            "NotImplemented: aten.addmm.out handler requires input and output to alias"
+        )
     if not (isinstance(a, DTensor) and isinstance(b, DTensor) and isinstance(c, DTensor)):
-        raise RuntimeError("aten.mm.out handler expects a, b, and out to be DTensors")
+        raise RuntimeError("aten.addmm.out handler expects a, b, and out to be DTensors")
     if not (a.ndim == 2 and b.ndim == 2 and c.ndim == 2):
-        raise RuntimeError("aten.mm.out handler expects a, b, and out to be rank-2 DTensors")
+        raise RuntimeError("aten.addmm.out handler expects a, b, and out to be rank-2 DTensors")
+
+    if a.shape[1] != b.shape[0] or c.shape[0] != a.shape[0] or c.shape[1] != b.shape[1]:
+        raise RuntimeError(
+            f"aten.addmm.out handler shape mismatch: a.shape={tuple(a.shape)}, "
+            f"b.shape={tuple(b.shape)}, c.shape={tuple(c.shape)}")
 
     for name, t in (("a", a), ("b", b), ("out", c)):
         if not (
@@ -47,19 +57,14 @@ def _mm_out_handler(
             and t.placements[0].dim == 0
         ):
             raise RuntimeError(
-                f"NotImplemented: aten.mm.out handler expects {name} to be row-sharded on a 1D mesh"
+                f"NotImplemented: aten.addmm.out handler expects {name} to be row-sharded on a 1D mesh"
             )
-
-    if a.shape[1] != b.shape[0] or c.shape[0] != a.shape[0] or c.shape[1] != b.shape[1]:
-        raise RuntimeError(
-            f"aten.mm.out handler shape mismatch: a.shape={tuple(a.shape)}, "
-            f"b.shape={tuple(b.shape)}, c.shape={tuple(c.shape)}")
 
     _row_partitioned_matmul(a, b, c)
 
 
 _CUSTOM_OPS = {
-    aten.mm.out: _mm_out_handler,
+    aten.addmm.out: _addmm_out_handler,
 }
 
 
