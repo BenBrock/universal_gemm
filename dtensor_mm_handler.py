@@ -8,6 +8,30 @@ import dtensor_utils as dt
 
 aten = torch.ops.aten
 
+def _row_partitioned_matmul_async(a: DTensor, b: DTensor, c: DTensor):
+    # a, b, c have already been verified at this point.
+
+    for i in range(dt.grid_shape(a)[0]):
+        if dist.get_rank() == dt.tile_rank(a, (i, 0)):
+            a_tile = dt.tile(a, (i, 0))
+            c_tile = dt.tile(c, (i, 0))
+
+            b_f = dt.get_tile_async(b, (i, 0))
+
+            for k_ in range(dt.grid_shape(b)[0]):
+                k = (k_ + i) % dt.grid_shape(b)[0]
+
+                b_tile = b_f.get()
+
+                if k_ + 1 < dt.grid_shape(b)[0]:
+                    b_f = dt.get_tile_async(b, ((k + 1) % dt.grid_shape(b)[0], 0))
+
+                tile_shape = dt.tile_shape(b)
+
+                a_view = a_tile[:,k*tile_shape[0]:(k+1)*tile_shape[0]]
+
+                torch.addmm(c_tile, a_view, b_tile, out=c_tile)
+
 def _row_partitioned_matmul(a: DTensor, b: DTensor, c: DTensor):
     # a, b, c have already been verified at this point.
 
@@ -16,9 +40,15 @@ def _row_partitioned_matmul(a: DTensor, b: DTensor, c: DTensor):
             a_tile = dt.tile(a, (i, 0))
             c_tile = dt.tile(c, (i, 0))
 
+            b_f = dt.get_tile_async(b, (i, 0))
+
             for k_ in range(dt.grid_shape(b)[0]):
                 k = (k_ + i) % dt.grid_shape(b)[0]
-                b_tile = dt.get_tile(b, (k, 0))
+
+                b_tile = b_f.get()
+
+                if k_ + 1 < dt.grid_shape(b)[0]:
+                    b_f = dt.get_tile_async(b, ((k + 1) % dt.grid_shape(b)[0], 0))
 
                 tile_shape = dt.tile_shape(b)
 

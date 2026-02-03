@@ -188,3 +188,51 @@ def tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:
     rows, cols = tile_shape(dt, coord)
     local = dt.to_local()
     return local[:rows, :cols]
+
+
+class _TileFuture:
+    def __init__(
+        self,
+        tensor: torch.Tensor,
+        event: torch.cuda.Event,
+        rows: int,
+        cols: int,
+    ) -> None:
+        self._tensor = tensor
+        self._event = event
+        self._rows = rows
+        self._cols = cols
+
+    def get(self) -> torch.Tensor:
+        self._event.synchronize()
+        return self._tensor[: self._rows, : self._cols]
+
+
+def get_tile_async(dt: DTensor, coord: tuple[int, int]) -> _TileFuture:
+    """
+    Asynchronously fetch a tile. Returns a future with a .get() method.
+    """
+    if dt.ndim != 2:
+        raise ValueError(f"get_tile_async expects a 2D DTensor, got ndim={dt.ndim}")
+
+    grid_rows, grid_cols = grid_shape(dt)
+    row_idx, col_idx = coord
+    if not (0 <= row_idx < grid_rows and 0 <= col_idx < grid_cols):
+        raise ValueError(
+            f"tile coord {coord} out of range for grid {(grid_rows, grid_cols)}"
+        )
+
+    max_shape = tile_shape(dt)
+    rows, cols = tile_shape(dt, coord)
+    owner_rank = tile_rank(dt, coord)
+
+    local_buf = torch.empty(max_shape, dtype=dt.dtype, device=dt.device)
+    if dist.is_initialized() and owner_rank == dist.get_rank():
+        local_buf.copy_(dt.nvshmem_base())
+    else:
+        remote_buf = nvshmem.get_peer_tensor(dt.nvshmem_base(), owner_rank)
+        local_buf.copy_(remote_buf)
+
+    event = torch.cuda.Event()
+    event.record(torch.cuda.current_stream())
+    return _TileFuture(local_buf, event, rows, cols)

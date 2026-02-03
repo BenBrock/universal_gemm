@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # example.py
 import os
+import time
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -54,9 +55,9 @@ def main():
 
     dtensor_mm_handler.enable()
 
-    m = 1024
-    n = 1024
-    k = 1024
+    m = 8*1024
+    n = 8*1024
+    k = 8*1024
 
     '''
     NOTE: I *think* things should work for uneven tile sizes?
@@ -68,19 +69,39 @@ def main():
     b_p = benchmark.util.row_partitioning()
     c_p = benchmark.util.row_partitioning()
 
-    global_a = torch.randn(m, k, dtype=torch.float32)*50 + 50
-    global_b = torch.randn(k, n, dtype=torch.float32)*50 + 50
-    global_c = torch.zeros(m, n, dtype=torch.float32)*50 + 50
+    global_a = torch.randn(m, k, dtype=torch.float32, device=device)*50 + 50
+    global_b = torch.randn(k, n, dtype=torch.float32, device=device)*50 + 50
+    global_c = torch.zeros(m, n, dtype=torch.float32, device=device)*50 + 50
 
     dt_a = distribute_tensor(global_a, *a_p)
     dt_b = distribute_tensor(global_b, *b_p)
     dt_c = distribute_tensor(global_c, *c_p)
 
-    dist.barrier()
-    torch.addmm(dt_c, dt_a, dt_b, out=dt_c)
-    dist.barrier()
+    n_iterations = 10
 
-    torch.addmm(global_c, global_a, global_b, out=global_c)
+    durations = []
+
+    for i in range(n_iterations):
+        dist.barrier()
+        begin = time.time()
+        torch.addmm(dt_c, dt_a, dt_b, out=dt_c)
+        torch.cuda.synchronize()
+        dist.barrier()
+        end = time.time()
+        duration = end - begin
+
+        durations.append(duration)
+
+    ref_durations = []
+    for i in range(n_iterations):
+        begin = time.time()
+        torch.addmm(global_c, global_a, global_b, out=global_c)
+        torch.cuda.synchronize()
+        end = time.time()
+        duration = end - begin
+
+        ref_durations.append(duration)
+
     full_c = dt_c.full_tensor()
     if rank == 0:
         torch.testing.assert_close(
@@ -89,6 +110,18 @@ def main():
             rtol=1e-4,
             atol=1e-5,
         )
+
+    if rank == 0:
+        gflops = 1e-9 * ((2 * m * n * k) + (3 * m * n))
+
+        all_gflops = [gflops / duration for duration in durations]
+        reference_gflops = [gflops / duration for duration in ref_durations]
+        print(f"Max Distributed GFLOPs: {np.max(all_gflops)}")
+        print(f"Median Distributed GFLOPs: {np.median(all_gflops)}")
+        print(f"Max Reference (Single GPU) GFLOPs: {np.max(reference_gflops)}")
+        print(f"Median Reference (Single GPU) GFLOPs: {np.median(reference_gflops)}")
+
+        print(f"Median speedup is {np.median(all_gflops) / np.median(reference_gflops)} over a single GPU.")
 
     nvshmem.free_tensor(dt_a.nvshmem_base())
     nvshmem.free_tensor(dt_b.nvshmem_base())
