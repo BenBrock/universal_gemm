@@ -55,7 +55,7 @@ def main():
 
     dtensor_mm_handler.enable()
 
-    m = 8*1024
+    m = 1024
     n = 8*1024
     k = 8*1024
 

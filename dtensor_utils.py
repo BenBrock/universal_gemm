@@ -232,17 +232,11 @@ def tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:
     return local[:rows, :cols]
 
 
-def release_tile(tile: torch.Tensor, event: torch.cuda.Event | None = None) -> None:
+def release_tile(tile: torch.Tensor) -> None:
     """
     Return a pooled scratch tile to the free list (no-op if not pooled).
     """
-    if _tile_pool is None:
-        return
     owner = getattr(tile, "_scratch_owner", None)
-    if owner is None:
-        return
-    if event is not None:
-        event.synchronize()
     _tile_pool.free(owner)
 
 

@@ -55,14 +55,14 @@ def _row_partitioned_matmul_async(a: DTensor, b: DTensor, c: DTensor):
 
                 a_view = a_tile[:,k*tile_shape[0]:(k+1)*tile_shape[0]]
 
+                print(f'Need to multiply a ({a_tile.shape}) (trimmed to {a_view.shape}) by b({b_tile.shape}) -> c({c_tile.shape})')
+
                 begin = time.time()
                 torch.addmm(c_tile, a_view, b_tile, out=c_tile)
-                torch.current_stream().synchronize()
+                torch.cuda.current_stream().synchronize()
                 end = time.time()
                 compute += end - begin
-                done = torch.cuda.Event()
-                done.record(torch.cuda.current_stream())
-                dt.release_tile(b_tile, done)
+                dt.release_tile(b_tile)
 
 def _row_partitioned_matmul(a: DTensor, b: DTensor, c: DTensor):
     # a, b, c have already been verified at this point.
@@ -126,7 +126,7 @@ def _addmm_out_handler(
                 f"NotImplemented: aten.addmm.out handler expects {name} to be row-sharded on a 1D mesh"
             )
 
-    _row_partitioned_matmul_async(a, b, c)
+    _row_partitioned_matmul(a, b, c)
 
 
 _CUSTOM_OPS = {
