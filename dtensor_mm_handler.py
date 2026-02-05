@@ -57,6 +57,7 @@ def _row_partitioned_matmul_async(a: DTensor, b: DTensor, c: DTensor):
 
                 begin = time.time()
                 torch.addmm(c_tile, a_view, b_tile, out=c_tile)
+                torch.current_stream().synchronize()
                 end = time.time()
                 compute += end - begin
                 done = torch.cuda.Event()

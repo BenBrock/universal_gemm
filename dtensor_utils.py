@@ -1,23 +1,23 @@
 import torch
 import torch.distributed as dist
 import nvshmem.core as nvshmem
+from cuda.core.experimental import Device
+from cuda.core.experimental._stream import Stream
 
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from dtensor_scratch import NvshmemTensorPool
 
 _tile_pool: NvshmemTensorPool | None = None
-_get_tile_async_torch_stream: torch.cuda.Stream | None = None
-_get_tile_async_nvshmem_stream: nvshmem.nvshmem_types.NvshmemStream | None = None
+_get_tile_async_raw_nvshmem_stream: Stream | None = None
 
 
-def _get_async_streams() -> tuple[torch.cuda.Stream, nvshmem.nvshmem_types.NvshmemStream]:
-    global _get_tile_async_torch_stream
-    global _get_tile_async_nvshmem_stream
-    if _get_tile_async_torch_stream is None or _get_tile_async_nvshmem_stream is None:
-        _get_tile_async_torch_stream = torch.cuda.Stream()
-        _get_tile_async_nvshmem_stream = nvshmem.NvshmemStream(_get_tile_async_torch_stream)
-    return _get_tile_async_torch_stream, _get_tile_async_nvshmem_stream
+def _get_async_nvshmem_stream() -> Stream:
+    global _get_tile_async_raw_nvshmem_stream
+    if _get_tile_async_raw_nvshmem_stream is None:
+        device_id = torch.cuda.current_device()
+        _get_tile_async_raw_nvshmem_stream = Device(device_id).create_stream()
+    return _get_tile_async_raw_nvshmem_stream
 
 
 def init_get_tile_scratch(
@@ -200,12 +200,11 @@ def get_tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:
             "get_tile requires init_get_tile_scratch(dt) to be called collectively before use."
         )
     scratch = _tile_pool.alloc()
-    torch_stream, nvshmem_stream = _get_async_streams()
+    torch_stream = torch.cuda.Stream()
     src = dt.nvshmem_base().view(max_shape)
-    nvshmem.get(scratch, src, remote_pe=owner_rank, stream=nvshmem_stream)
-    nvshmem.quiet(nvshmem_stream)
+    nvshmem.get(scratch, src, remote_pe=owner_rank, stream=torch_stream)
+    nvshmem.quiet(torch_stream)
     torch_stream.synchronize()
-    torch.cuda.current_stream().wait_stream(torch_stream)
     local_buf.copy_(scratch)
     _tile_pool.free(scratch)
 
@@ -251,20 +250,18 @@ class _TileFuture:
     def __init__(
         self,
         scratch: torch.Tensor,
-        torch_stream: torch.cuda.Stream,
         nvshmem_stream: nvshmem.nvshmem_types.NvshmemStream,
         rows: int,
         cols: int,
     ) -> None:
         self._scratch = scratch
-        self._torch_stream = torch_stream
         self._nvshmem_stream = nvshmem_stream
         self._rows = rows
         self._cols = cols
 
     def get(self) -> torch.Tensor:
         nvshmem.quiet(self._nvshmem_stream)
-        torch.cuda.current_stream().wait_stream(self._torch_stream)
+        self._nvshmem_stream.sync()
         view = self._scratch[: self._rows, : self._cols]
         view._scratch_owner = self._scratch
         return view
@@ -293,7 +290,7 @@ def get_tile_async(dt: DTensor, coord: tuple[int, int]) -> _TileFuture:
             "get_tile_async requires init_get_tile_scratch(dt) to be called collectively before use."
         )
     scratch = _tile_pool.alloc()
-    torch_stream, nvshmem_stream = _get_async_streams()
+    nvshmem_stream = _get_async_nvshmem_stream()
     src = dt.nvshmem_base().view(max_shape)
     nvshmem.get(scratch, src, remote_pe=owner_rank, stream=nvshmem_stream)
-    return _TileFuture(scratch, torch_stream, nvshmem_stream, rows, cols)
+    return _TileFuture(scratch, nvshmem_stream, rows, cols)
