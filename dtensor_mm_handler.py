@@ -18,8 +18,8 @@ def print_stats():
     global comm_sync
     global compute
     total = comm_issue + comm_sync + compute
-    print(f'comm_issue: {comm_issue}, comm_synmc: {comm_sync}, compute: {compute}')
-    print(f'comm_issue: {100*(comm_issue/total)}%, comm_synmc: {100*(comm_sync/total)}%, compute: {100*(compute/total)}')
+    print(f'comm_issue: {comm_issue}, comm_sync: {comm_sync}, compute: {compute}')
+    print(f'comm_issue: {100*(comm_issue/total)}%, comm_sync: {100*(comm_sync/total)}%, compute: {100*(compute/total)}')
 
 def _row_partitioned_matmul_async(a: DTensor, b: DTensor, c: DTensor):
     # a, b, c have already been verified at this point.
@@ -59,6 +59,9 @@ def _row_partitioned_matmul_async(a: DTensor, b: DTensor, c: DTensor):
                 torch.addmm(c_tile, a_view, b_tile, out=c_tile)
                 end = time.time()
                 compute += end - begin
+                done = torch.cuda.Event()
+                done.record(torch.cuda.current_stream())
+                dt.release_tile(b_tile, done)
 
 def _row_partitioned_matmul(a: DTensor, b: DTensor, c: DTensor):
     # a, b, c have already been verified at this point.

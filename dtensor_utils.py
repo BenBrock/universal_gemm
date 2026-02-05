@@ -4,34 +4,43 @@ import nvshmem.core as nvshmem
 
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
+from dtensor_scratch import NvshmemTensorPool
 
-_get_tile_scratch: dict[tuple[torch.dtype, torch.device, tuple[int, int]], torch.Tensor] = {}
+_tile_pool: NvshmemTensorPool | None = None
+_get_tile_async_torch_stream: torch.cuda.Stream | None = None
+_get_tile_async_nvshmem_stream: nvshmem.nvshmem_types.NvshmemStream | None = None
 
 
-def init_get_tile_scratch(dt: DTensor) -> torch.Tensor:
+def _get_async_streams() -> tuple[torch.cuda.Stream, nvshmem.nvshmem_types.NvshmemStream]:
+    global _get_tile_async_torch_stream
+    global _get_tile_async_nvshmem_stream
+    if _get_tile_async_torch_stream is None or _get_tile_async_nvshmem_stream is None:
+        _get_tile_async_torch_stream = torch.cuda.Stream()
+        _get_tile_async_nvshmem_stream = nvshmem.NvshmemStream(_get_tile_async_torch_stream)
+    return _get_tile_async_torch_stream, _get_tile_async_nvshmem_stream
+
+
+def init_get_tile_scratch(
+    dt: DTensor,
+    slots: int = 4,
+) -> None:
     """
-    Allocate and cache an NVSHMEM-backed scratch tensor for get_tile.
-
-    This must be called collectively by all ranks.
+    Allocate a pool of NVSHMEM tensors for temporary tiles (collective).
     """
+    global _tile_pool
     max_shape = tile_shape(dt)
-    key = (dt.dtype, dt.device, max_shape)  # type: ignore[arg-type]
-    scratch = _get_tile_scratch.get(key)
-    if scratch is None:
-        scratch = nvshmem.tensor(max_shape, dtype=dt.dtype)
-        _get_tile_scratch[key] = scratch
-    return scratch
+    if _tile_pool is None:
+        _tile_pool = NvshmemTensorPool(max_shape, dt.dtype, slots)
 
 
 def free_get_tile_scratch() -> None:
     """
-    Free all cached NVSHMEM-backed scratch tensors.
-
-    This must be called collectively by all ranks.
+    Free the NVSHMEM pool (collective).
     """
-    for scratch in _get_tile_scratch.values():
-        nvshmem.free_tensor(scratch)
-    _get_tile_scratch.clear()
+    global _tile_pool
+    if _tile_pool is not None:
+        _tile_pool.close()
+        _tile_pool = None
 
 
 def grid_shape(dt: DTensor) -> tuple[int, int]:
@@ -186,18 +195,19 @@ def get_tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:
     local_buf = torch.empty(
         max_shape, dtype=dt.dtype, device=dt.device  # type: ignore[arg-type]
     )
-    key = (dt.dtype, dt.device, max_shape)  # type: ignore[arg-type]
-    scratch = _get_tile_scratch.get(key)
-    if scratch is None:
+    if _tile_pool is None:
         raise RuntimeError(
             "get_tile requires init_get_tile_scratch(dt) to be called collectively before use."
         )
-    stream = nvshmem.NvshmemStream(torch.cuda.current_stream())
+    scratch = _tile_pool.alloc()
+    torch_stream, nvshmem_stream = _get_async_streams()
     src = dt.nvshmem_base().view(max_shape)
-    nvshmem.get(scratch, src, remote_pe=owner_rank, stream=stream)
-    nvshmem.quiet(stream)
-    torch.cuda.synchronize()
+    nvshmem.get(scratch, src, remote_pe=owner_rank, stream=nvshmem_stream)
+    nvshmem.quiet(nvshmem_stream)
+    torch_stream.synchronize()
+    torch.cuda.current_stream().wait_stream(torch_stream)
     local_buf.copy_(scratch)
+    _tile_pool.free(scratch)
 
     rows, cols = actual_shape
     return local_buf[:rows, :cols]
@@ -223,25 +233,41 @@ def tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:
     return local[:rows, :cols]
 
 
+def release_tile(tile: torch.Tensor, event: torch.cuda.Event | None = None) -> None:
+    """
+    Return a pooled scratch tile to the free list (no-op if not pooled).
+    """
+    if _tile_pool is None:
+        return
+    owner = getattr(tile, "_scratch_owner", None)
+    if owner is None:
+        return
+    if event is not None:
+        event.synchronize()
+    _tile_pool.free(owner)
+
+
 class _TileFuture:
     def __init__(
         self,
-        tensor: torch.Tensor,
-        event: torch.cuda.Event,
+        scratch: torch.Tensor,
+        torch_stream: torch.cuda.Stream,
+        nvshmem_stream: nvshmem.nvshmem_types.NvshmemStream,
         rows: int,
         cols: int,
-        stream: nvshmem.nvshmem_types.NvshmemStream,
     ) -> None:
-        self._tensor = tensor
-        self._event = event
+        self._scratch = scratch
+        self._torch_stream = torch_stream
+        self._nvshmem_stream = nvshmem_stream
         self._rows = rows
         self._cols = cols
-        self._stream = stream
 
     def get(self) -> torch.Tensor:
-        nvshmem.quiet(self._stream)
-        self._event.synchronize()
-        return self._tensor[: self._rows, : self._cols]
+        nvshmem.quiet(self._nvshmem_stream)
+        torch.cuda.current_stream().wait_stream(self._torch_stream)
+        view = self._scratch[: self._rows, : self._cols]
+        view._scratch_owner = self._scratch
+        return view
 
 
 def get_tile_async(dt: DTensor, coord: tuple[int, int]) -> _TileFuture:
@@ -262,18 +288,12 @@ def get_tile_async(dt: DTensor, coord: tuple[int, int]) -> _TileFuture:
     rows, cols = tile_shape(dt, coord)
     owner_rank = tile_rank(dt, coord)
 
-    local_buf = torch.empty(max_shape, dtype=dt.dtype, device=dt.device)
-    key = (dt.dtype, dt.device, max_shape)  # type: ignore[arg-type]
-    scratch = _get_tile_scratch.get(key)
-    if scratch is None:
+    if _tile_pool is None:
         raise RuntimeError(
             "get_tile_async requires init_get_tile_scratch(dt) to be called collectively before use."
         )
-    stream = nvshmem.NvshmemStream(torch.cuda.current_stream())
+    scratch = _tile_pool.alloc()
+    torch_stream, nvshmem_stream = _get_async_streams()
     src = dt.nvshmem_base().view(max_shape)
-    nvshmem.get(scratch, src, remote_pe=owner_rank, stream=stream)
-    local_buf.copy_(scratch)
-
-    event = torch.cuda.Event()
-    event.record(torch.cuda.current_stream())
-    return _TileFuture(local_buf, event, rows, cols, stream)
+    nvshmem.get(scratch, src, remote_pe=owner_rank, stream=nvshmem_stream)
+    return _TileFuture(scratch, torch_stream, nvshmem_stream, rows, cols)
