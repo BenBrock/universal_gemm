@@ -5,6 +5,34 @@ import nvshmem.core as nvshmem
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
+_get_tile_scratch: dict[tuple[torch.dtype, torch.device, tuple[int, int]], torch.Tensor] = {}
+
+
+def init_get_tile_scratch(dt: DTensor) -> torch.Tensor:
+    """
+    Allocate and cache an NVSHMEM-backed scratch tensor for get_tile.
+
+    This must be called collectively by all ranks.
+    """
+    max_shape = tile_shape(dt)
+    key = (dt.dtype, dt.device, max_shape)  # type: ignore[arg-type]
+    scratch = _get_tile_scratch.get(key)
+    if scratch is None:
+        scratch = nvshmem.tensor(max_shape, dtype=dt.dtype)
+        _get_tile_scratch[key] = scratch
+    return scratch
+
+
+def free_get_tile_scratch() -> None:
+    """
+    Free all cached NVSHMEM-backed scratch tensors.
+
+    This must be called collectively by all ranks.
+    """
+    for scratch in _get_tile_scratch.values():
+        nvshmem.free_tensor(scratch)
+    _get_tile_scratch.clear()
+
 
 def grid_shape(dt: DTensor) -> tuple[int, int]:
     """
@@ -158,13 +186,18 @@ def get_tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:
     local_buf = torch.empty(
         max_shape, dtype=dt.dtype, device=dt.device  # type: ignore[arg-type]
     )
-    if dist.is_initialized() and owner_rank == dist.get_rank():
-        local_buf.copy_(dt.nvshmem_base())
-        torch.cuda.synchronize()
-    else:
-        remote_buf = nvshmem.get_peer_tensor(dt.nvshmem_base(), owner_rank)
-        local_buf.copy_(remote_buf)
-        torch.cuda.synchronize()
+    key = (dt.dtype, dt.device, max_shape)  # type: ignore[arg-type]
+    scratch = _get_tile_scratch.get(key)
+    if scratch is None:
+        raise RuntimeError(
+            "get_tile requires init_get_tile_scratch(dt) to be called collectively before use."
+        )
+    stream = nvshmem.NvshmemStream(torch.cuda.current_stream())
+    src = dt.nvshmem_base().view(max_shape)
+    nvshmem.get(scratch, src, remote_pe=owner_rank, stream=stream)
+    nvshmem.quiet(stream)
+    torch.cuda.synchronize()
+    local_buf.copy_(scratch)
 
     rows, cols = actual_shape
     return local_buf[:rows, :cols]

@@ -1,5 +1,6 @@
 import torch
 import torch.distributed as dist
+import time
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
@@ -8,53 +9,84 @@ import dtensor_utils as dt
 
 aten = torch.ops.aten
 
+comm_issue = 0
+comm_sync = 0
+compute = 0
+
+def print_stats():
+    global comm_issue
+    global comm_sync
+    global compute
+    total = comm_issue + comm_sync + compute
+    print(f'comm_issue: {comm_issue}, comm_synmc: {comm_sync}, compute: {compute}')
+    print(f'comm_issue: {100*(comm_issue/total)}%, comm_synmc: {100*(comm_sync/total)}%, compute: {100*(compute/total)}')
+
 def _row_partitioned_matmul_async(a: DTensor, b: DTensor, c: DTensor):
     # a, b, c have already been verified at this point.
+    global comm_issue
+    global comm_sync
+    global compute
 
     for i in range(dt.grid_shape(a)[0]):
         if dist.get_rank() == dt.tile_rank(a, (i, 0)):
             a_tile = dt.tile(a, (i, 0))
             c_tile = dt.tile(c, (i, 0))
 
+            begin = time.time()
             b_f = dt.get_tile_async(b, (i, 0))
+            end = time.time()
+            comm_issue += end - begin
 
             for k_ in range(dt.grid_shape(b)[0]):
                 k = (k_ + i) % dt.grid_shape(b)[0]
 
+                begin = time.time()
                 b_tile = b_f.get()
+                end = time.time()
+                comm_sync += end - begin
 
                 if k_ + 1 < dt.grid_shape(b)[0]:
+                    begin = time.time()
                     b_f = dt.get_tile_async(b, ((k + 1) % dt.grid_shape(b)[0], 0))
+                    end = time.time()
+                    comm_issue += end - begin
 
                 tile_shape = dt.tile_shape(b)
 
                 a_view = a_tile[:,k*tile_shape[0]:(k+1)*tile_shape[0]]
 
+                begin = time.time()
                 torch.addmm(c_tile, a_view, b_tile, out=c_tile)
+                end = time.time()
+                compute += end - begin
 
 def _row_partitioned_matmul(a: DTensor, b: DTensor, c: DTensor):
     # a, b, c have already been verified at this point.
+    global comm_issue
+    global comm_sync
+    global compute
 
     for i in range(dt.grid_shape(a)[0]):
         if dist.get_rank() == dt.tile_rank(a, (i, 0)):
             a_tile = dt.tile(a, (i, 0))
             c_tile = dt.tile(c, (i, 0))
 
-            b_f = dt.get_tile_async(b, (i, 0))
-
             for k_ in range(dt.grid_shape(b)[0]):
                 k = (k_ + i) % dt.grid_shape(b)[0]
 
-                b_tile = b_f.get()
-
-                if k_ + 1 < dt.grid_shape(b)[0]:
-                    b_f = dt.get_tile_async(b, ((k + 1) % dt.grid_shape(b)[0], 0))
+                begin = time.time()
+                b_tile = dt.get_tile(b, (k,0))
+                end = time.time()
+                comm_sync += end - begin
 
                 tile_shape = dt.tile_shape(b)
 
                 a_view = a_tile[:,k*tile_shape[0]:(k+1)*tile_shape[0]]
 
+                begin = time.time()
                 torch.addmm(c_tile, a_view, b_tile, out=c_tile)
+                end = time.time()
+                compute += end - begin
 
 
 def _addmm_out_handler(
@@ -90,7 +122,7 @@ def _addmm_out_handler(
                 f"NotImplemented: aten.addmm.out handler expects {name} to be row-sharded on a 1D mesh"
             )
 
-    _row_partitioned_matmul(a, b, c)
+    _row_partitioned_matmul_async(a, b, c)
 
 
 _CUSTOM_OPS = {

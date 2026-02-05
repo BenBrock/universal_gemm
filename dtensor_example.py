@@ -8,6 +8,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
 
 import benchmark.util
+import dtensor_utils as dt
 import dtensor_mm_handler
 import dtensor_utils
 import nvshmem.core as nvshmem
@@ -77,6 +78,8 @@ def main():
     dt_b = distribute_tensor(global_b, *b_p)
     dt_c = distribute_tensor(global_c, *c_p)
 
+    dt.init_get_tile_scratch(dt_a)
+
     n_iterations = 10
 
     durations = []
@@ -85,12 +88,14 @@ def main():
         dist.barrier()
         begin = time.time()
         torch.addmm(dt_c, dt_a, dt_b, out=dt_c)
-        torch.cuda.synchronize()
-        dist.barrier()
+        nvshmem.barrier_all(stream=stream)
         end = time.time()
         duration = end - begin
 
         durations.append(duration)
+
+    if rank == 0:
+        dtensor_mm_handler.print_stats()
 
     ref_durations = []
     for i in range(n_iterations):
@@ -126,6 +131,7 @@ def main():
     nvshmem.free_tensor(dt_a.nvshmem_base())
     nvshmem.free_tensor(dt_b.nvshmem_base())
     nvshmem.free_tensor(dt_c.nvshmem_base())
+    dt.free_get_tile_scratch()
     nvshmem.finalize()
     dist.destroy_process_group()
 
