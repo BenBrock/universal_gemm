@@ -10,7 +10,6 @@ from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
 import benchmark.util
 import dtensor_utils as dt
 import dtensor_mm_handler
-import dtensor_utils
 import nvshmem.core as nvshmem
 from cuda.core.experimental import Device
 

@@ -230,13 +230,16 @@ class _TileFuture:
         event: torch.cuda.Event,
         rows: int,
         cols: int,
+        stream: nvshmem.nvshmem_types.NvshmemStream,
     ) -> None:
         self._tensor = tensor
         self._event = event
         self._rows = rows
         self._cols = cols
+        self._stream = stream
 
     def get(self) -> torch.Tensor:
+        nvshmem.quiet(self._stream)
         self._event.synchronize()
         return self._tensor[: self._rows, : self._cols]
 
@@ -260,12 +263,17 @@ def get_tile_async(dt: DTensor, coord: tuple[int, int]) -> _TileFuture:
     owner_rank = tile_rank(dt, coord)
 
     local_buf = torch.empty(max_shape, dtype=dt.dtype, device=dt.device)
-    if dist.is_initialized() and owner_rank == dist.get_rank():
-        local_buf.copy_(dt.nvshmem_base())
-    else:
-        remote_buf = nvshmem.get_peer_tensor(dt.nvshmem_base(), owner_rank)
-        local_buf.copy_(remote_buf)
+    key = (dt.dtype, dt.device, max_shape)  # type: ignore[arg-type]
+    scratch = _get_tile_scratch.get(key)
+    if scratch is None:
+        raise RuntimeError(
+            "get_tile_async requires init_get_tile_scratch(dt) to be called collectively before use."
+        )
+    stream = nvshmem.NvshmemStream(torch.cuda.current_stream())
+    src = dt.nvshmem_base().view(max_shape)
+    nvshmem.get(scratch, src, remote_pe=owner_rank, stream=stream)
+    local_buf.copy_(scratch)
 
     event = torch.cuda.Event()
     event.record(torch.cuda.current_stream())
-    return _TileFuture(local_buf, event, rows, cols)
+    return _TileFuture(local_buf, event, rows, cols, stream)
