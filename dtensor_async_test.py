@@ -75,7 +75,10 @@ def main():
 
     dt_a = distribute_tensor(global_a, *a_p)
 
-    dt.init_get_tile_scratch(dt_a)
+    tile_shape = dt.tile_shape(dt_a)
+    tile_numel = tile_shape[0] * tile_shape[1]
+    tiles_per_round = dt.grid_shape(dt_a)[0] * dt.grid_shape(dt_a)[1]
+    dt.init_scratch(tile_numel * tiles_per_round, dt_a.dtype)
 
     dist.barrier()
 

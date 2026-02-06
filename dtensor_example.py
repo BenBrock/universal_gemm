@@ -55,7 +55,7 @@ def main():
 
     dtensor_mm_handler.enable()
 
-    m = 1024
+    m = 8*1024
     n = 8*1024
     k = 8*1024
 
@@ -77,7 +77,11 @@ def main():
     dt_b = distribute_tensor(global_b, *b_p)
     dt_c = distribute_tensor(global_c, *c_p)
 
-    dt.init_get_tile_scratch(dt_a)
+    b_tile_shape = dt.tile_shape(dt_b)
+    b_tile_numel = b_tile_shape[0] * b_tile_shape[1]
+    b_tiles_per_round = dt.grid_shape(dt_b)[0]
+    scratch_elements = b_tile_numel * b_tiles_per_round
+    dt.init_scratch(scratch_elements, dt_b.dtype)
 
     n_iterations = 10
 
@@ -88,6 +92,7 @@ def main():
         begin = time.time()
         torch.addmm(dt_c, dt_a, dt_b, out=dt_c)
         nvshmem.barrier_all(stream=stream)
+        torch.cuda.current_stream().synchronize()
         end = time.time()
         duration = end - begin
 
@@ -100,7 +105,7 @@ def main():
     for i in range(n_iterations):
         begin = time.time()
         torch.addmm(global_c, global_a, global_b, out=global_c)
-        torch.cuda.synchronize()
+        torch.cuda.current_stream().synchronize()
         end = time.time()
         duration = end - begin
 

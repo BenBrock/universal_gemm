@@ -1,52 +1,53 @@
-import threading
-import weakref
-from typing import Dict, List, Tuple
+import math
+from typing import Tuple
 
 import torch
 import nvshmem.core as nvshmem
+from cuda.core.experimental._memory import Buffer
 
 
-class NvshmemTensorPool:
+class NvshmemHeap:
     """
-    Pool of NVSHMEM-backed tensors allocated collectively once.
-
-    Tensors are returned to the free list via weakref.finalize when GC'd,
-    or explicitly via free().
+    Simple bump allocator backed by a single NVSHMEM tensor.
     """
 
-    def __init__(self, shape: Tuple[int, int], dtype: torch.dtype, slots: int) -> None:
-        self._lock = threading.Lock()
-        self._shape = shape
+    def __init__(self, capacity_elements: int, dtype: torch.dtype) -> None:
+        if capacity_elements <= 0:
+            raise ValueError("capacity_elements must be positive")
         self._dtype = dtype
-        self._tensors: List[torch.Tensor] = [nvshmem.tensor(shape, dtype=dtype) for _ in range(slots)]
-        self._free: List[int] = list(range(slots))
-        self._in_use: Dict[int, int] = {}
+        self._capacity = capacity_elements
+        self._buffer = nvshmem.tensor((capacity_elements,), dtype=dtype)
+        self._base_ptr = int(self._buffer.data_ptr())
+        self._element_size = torch.tensor([], dtype=dtype).element_size()
+        self._heap_ptr = 0
 
-    def alloc(self) -> torch.Tensor:
-        with self._lock:
-            if not self._free:
-                raise RuntimeError("NvshmemTensorPool exhausted")
-            idx = self._free.pop()
-            t = self._tensors[idx]
-            self._in_use[id(t)] = idx
-            # Ensure finalizer stays alive by attaching to the tensor object.
-            t._pool_finalizer = weakref.finalize(t, self._return_to_pool, idx)
-            return t
+    @property
+    def capacity(self) -> int:
+        return self._capacity
 
-    def free(self, tensor: torch.Tensor) -> None:
-        idx = self._in_use.pop(id(tensor), None)
-        if idx is None:
-            return
-        with self._lock:
-            self._free.append(idx)
+    def reset(self) -> None:
+        self._heap_ptr = 0
 
-    def _return_to_pool(self, idx: int) -> None:
-        with self._lock:
-            self._free.append(idx)
+    def alloc(self, shape: Tuple[int, int] | Tuple[int, ...]) -> torch.Tensor:
+        numel = int(math.prod(shape))
+        if numel == 0:
+            return self._buffer.narrow(0, 0, 0).view(shape)
+        end = self._heap_ptr + numel
+        if end > self._capacity:
+            # Wrap to the start of the heap (no deallocation tracking yet).
+            self._heap_ptr = 0
+            end = numel
+        if end > self._capacity:
+            raise RuntimeError(
+                f"NvshmemHeap exhausted: requested={numel} elements, "
+                f"capacity={self._capacity} elements"
+            )
+        view = self._buffer[self._heap_ptr:end].view(shape)
+        byte_offset = self._heap_ptr * self._element_size
+        byte_size = numel * self._element_size
+        view._nvshmem_buf = Buffer.from_handle(self._base_ptr + byte_offset, byte_size)
+        self._heap_ptr = end
+        return view
 
     def close(self) -> None:
-        for t in self._tensors:
-            nvshmem.free_tensor(t)
-        self._tensors.clear()
-        self._free.clear()
-        self._in_use.clear()
+        nvshmem.free_tensor(self._buffer)
