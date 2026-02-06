@@ -228,6 +228,7 @@ def get_tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:
     stream = torch.cuda.current_stream()
     nvshmem.get(scratch._nvshmem_buf, src, remote_pe=owner_rank, stream=stream)
     nvshmem.quiet(stream)
+    stream.synchronize()
     rows, cols = actual_shape
     return scratch[:rows, :cols]
 
