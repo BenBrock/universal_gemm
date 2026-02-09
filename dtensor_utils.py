@@ -8,7 +8,14 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from dtensor_scratch import NvshmemHeap
 from tile_bounds import Slice1D, Slice2D, overlapping_tiles, tile_bounds
-from stationary_c_plan import MultiplyOp, build_stationary_c_ops, format_op, format_plan
+from stationary_c_plan import (
+    MultiplyOp,
+    build_stationary_c_ops,
+    execute_stationary_c,
+    execute_stationary_c_ops,
+    format_op,
+    format_plan,
+)
 
 _tile_heap: NvshmemHeap | None = None
 _tile_heap_dtype: torch.dtype | None = None
