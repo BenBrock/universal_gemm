@@ -19,7 +19,8 @@ def print_stats():
     global compute
     total = comm_issue + comm_sync + compute
     print(f'comm_issue: {comm_issue}, comm_sync: {comm_sync}, compute: {compute}')
-    print(f'comm_issue: {100*(comm_issue/total)}%, comm_sync: {100*(comm_sync/total)}%, compute: {100*(compute/total)}')
+    if total > 0:
+        print(f'comm_issue: {100*(comm_issue/total)}%, comm_sync: {100*(comm_sync/total)}%, compute: {100*(compute/total)}')
 
 def _row_partitioned_matmul_async(a: DTensor, b: DTensor, c: DTensor):
     # a, b, c have already been verified at this point.
@@ -125,7 +126,7 @@ def _addmm_out_handler(
                 f"NotImplemented: aten.addmm.out handler expects {name} to be row-sharded on a 1D mesh"
             )
 
-    _row_partitioned_matmul_async(a, b, c)
+    dt.execute_stationary_c(a, b, c)
 
 
 _CUSTOM_OPS = {

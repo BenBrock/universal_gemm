@@ -13,27 +13,7 @@ import dtensor_mm_handler
 import nvshmem.core as nvshmem
 from cuda.core.experimental import Device
 
-def main():
-    # Init pytorch.dist
-    dist.init_process_group(backend='nccl')
-
-    assert os.environ.get("TORCH_DTENSOR_USE_NVSHMEM", "0") == "1", (
-        "Expected TORCH_DTENSOR_USE_NVSHMEM=1 for this example."
-    )
-
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
-    num_gpus = torch.cuda.device_count()
-    gpu_id = rank % num_gpus
-    torch.cuda.set_device(gpu_id)
-    device = torch.cuda.current_device()
-
-    print(f'Rank {rank}/{world_size} running on GPU {gpu_id}/{num_gpus}')
-
-    group = dist.group.WORLD
-
-    # Initialize NVSHMEM4Py using a UID broadcasted via torch.distributed
+def _init_nvshmem(rank: int, world_size: int, gpu_id: int) -> nvshmem.nvshmem_types.NvshmemStream:
     local_rank = int(os.environ.get("LOCAL_RANK", gpu_id))
     dev = Device(local_rank)
     dev.set_current()
@@ -51,23 +31,43 @@ def main():
         nranks=world_size,
         initializer_method="uid",
     )
-    stream = nvshmem.NvshmemStream(torch.cuda.current_stream())
+    return nvshmem.NvshmemStream(torch.cuda.current_stream())
+
+def get_partitioning(partition: str, replication_factor: int):
+    if partition == 'row':
+        return benchmark.util.row_partitioning(replication_factor=replication_factor)
+    elif partition == 'column':
+        return benchmark.util.column_partitioning(replication_factor=replication_factor)
+    elif partition == 'block':
+        return benchmark.util.two_dimensional_partitioning(replication_factor=replication_factor)
+    else:
+        raise RuntimeError(f'error: unsupported partitioning {partition}')
+
+def run_matmul_benchmark(m: int, n: int, k: int, a_partition: str, b_partition: str, c_partition: str, a_replication_factor: int, b_replication_factor: int, c_replication_factor: int):
+    # Init pytorch.dist
+    dist.init_process_group(backend='nccl')
+
+    assert os.environ.get("TORCH_DTENSOR_USE_NVSHMEM", "0") == "1", (
+        "Expected TORCH_DTENSOR_USE_NVSHMEM=1 for this example."
+    )
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    num_gpus = torch.cuda.device_count()
+    gpu_id = rank % num_gpus
+    torch.cuda.set_device(gpu_id)
+    device = torch.cuda.current_device()
+
+    print(f'Rank {rank}/{world_size} running on GPU {gpu_id}/{num_gpus}')
+
+    stream = _init_nvshmem(rank, world_size, gpu_id)
 
     dtensor_mm_handler.enable()
 
-    m = 8*1024
-    n = 8*1024
-    k = 8*1024
-
-    '''
-    NOTE: I *think* things should work for uneven tile sizes?
-    assert m % world_size == 0, "m must be divisible by world_size for even row sharding"
-    assert k % world_size == 0, "k must be divisible by world_size for even row sharding"
-    '''
-
-    a_p = benchmark.util.row_partitioning()
-    b_p = benchmark.util.row_partitioning()
-    c_p = benchmark.util.row_partitioning()
+    a_p = get_partitioning(a_partition, a_replication_factor)
+    b_p = get_partitioning(b_partition, b_replication_factor)
+    c_p = get_partitioning(c_partition, c_replication_factor)
 
     global_a = torch.randn(m, k, dtype=torch.float32, device=device)*50 + 50
     global_b = torch.randn(k, n, dtype=torch.float32, device=device)*50 + 50
@@ -77,11 +77,7 @@ def main():
     dt_b = distribute_tensor(global_b, *b_p)
     dt_c = distribute_tensor(global_c, *c_p)
 
-    b_tile_shape = dt.tile_shape(dt_b)
-    b_tile_numel = b_tile_shape[0] * b_tile_shape[1]
-    b_tiles_per_round = dt.grid_shape(dt_b)[0]
-    scratch_elements = b_tile_numel * b_tiles_per_round
-    dt.init_scratch(scratch_elements, dt_b.dtype)
+    dt.init_scratch(k * n, dt_b.dtype)
 
     n_iterations = 10
 
@@ -140,4 +136,5 @@ def main():
     dist.destroy_process_group()
 
 if __name__ == "__main__":
-    main()
+    m = n = k = 8192
+    run_matmul_benchmark(m, n, k, 'row', 'row', 'row', 1, 1, 1)
