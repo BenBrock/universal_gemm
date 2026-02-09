@@ -207,9 +207,8 @@ def tile_rank(dt: DTensor, coord: tuple[int, int]) -> int:
         col_coords = _unflatten_index(coord[1], col_sizes)
         for d, c in zip(col_dims, col_coords):
             full_coord[d] = c
-
-    rank_map = mesh._layout.remap_to_tensor(mesh._rank_map)
-    return int(rank_map[tuple(full_coord)].item())
+    
+    return int(mesh.mesh[tuple(full_coord)].item())
 
 
 def get_tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:

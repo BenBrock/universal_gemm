@@ -86,7 +86,7 @@ def run_matmul_benchmark(
     dt_b = distribute_tensor(global_b, *b_p)
     dt_c = distribute_tensor(global_c, *c_p)
 
-    dt.init_scratch(k * n, dt_b.dtype)
+    dt.init_scratch(2 * k * n, dt_b.dtype)
 
     if rank == 0:
         print(f'Multiply A {dt_a.shape} by B {dt_b.shape} -> C {dt_c.shape}')
