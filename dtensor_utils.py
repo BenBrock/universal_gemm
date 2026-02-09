@@ -7,7 +7,7 @@ from cuda.core.experimental._stream import Stream
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 from dtensor_scratch import NvshmemHeap
-from tile_bounds import Slice1D, Slice2D, tile_bounds
+from tile_bounds import Slice1D, Slice2D, overlapping_tiles, tile_bounds
 
 _tile_heap: NvshmemHeap | None = None
 _tile_heap_dtype: torch.dtype | None = None

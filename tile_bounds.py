@@ -98,3 +98,39 @@ def tile_bounds(dt: DTensor, coord: tuple[int, int]) -> Slice2D:
         rows=Slice1D(row_start, row_stop),
         cols=Slice1D(col_start, col_stop),
     )
+
+
+def overlapping_tiles(dt: DTensor, region: Slice2D) -> list[tuple[int, int]]:
+    """
+    Return tile coordinates that overlap with a global 2D region.
+
+    Overlap is computed on half-open intervals; a non-empty intersection on both
+    axes is required for a tile to be included.
+    """
+    if dt.ndim != 2:
+        raise ValueError(f"overlapping_tiles expects a 2D DTensor, got ndim={dt.ndim}")
+
+    m, n = dt.shape
+    # Clamp region to the valid global extent.
+    row_lo = max(0, region.rows.start)
+    row_hi = min(m, region.rows.stop)
+    col_lo = max(0, region.cols.start)
+    col_hi = min(n, region.cols.stop)
+
+    if row_lo >= row_hi or col_lo >= col_hi:
+        return []
+
+    grid_rows, grid_cols = _grid_shape(dt)
+    max_rows = (m + grid_rows - 1) // grid_rows
+    max_cols = (n + grid_cols - 1) // grid_cols
+
+    row_start_idx = max(0, min(grid_rows - 1, row_lo // max_rows))
+    row_end_idx = max(0, min(grid_rows - 1, (row_hi - 1) // max_rows))
+    col_start_idx = max(0, min(grid_cols - 1, col_lo // max_cols))
+    col_end_idx = max(0, min(grid_cols - 1, (col_hi - 1) // max_cols))
+
+    coords: list[tuple[int, int]] = []
+    for i in range(row_start_idx, row_end_idx + 1):
+        for j in range(col_start_idx, col_end_idx + 1):
+            coords.append((i, j))
+    return coords
