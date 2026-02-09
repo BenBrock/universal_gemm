@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # example.py
+import argparse
 import os
 import time
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
+from torch.distributed.tensor import distribute_tensor
 
 import benchmark.util
 import dtensor_utils as dt
@@ -43,7 +44,15 @@ def get_partitioning(partition: str, replication_factor: int):
     else:
         raise RuntimeError(f'error: unsupported partitioning {partition}')
 
-def run_matmul_benchmark(m: int, n: int, k: int, a_partition: str, b_partition: str, c_partition: str, a_replication_factor: int, b_replication_factor: int, c_replication_factor: int):
+def run_matmul_benchmark(
+    m: int,
+    n: int,
+    k: int,
+    a_partition: str,
+    b_partition: str,
+    c_partition: str,
+    replication_factor: int,
+):
     # Init pytorch.dist
     dist.init_process_group(backend='nccl')
 
@@ -65,9 +74,9 @@ def run_matmul_benchmark(m: int, n: int, k: int, a_partition: str, b_partition: 
 
     dtensor_mm_handler.enable()
 
-    a_p = get_partitioning(a_partition, a_replication_factor)
-    b_p = get_partitioning(b_partition, b_replication_factor)
-    c_p = get_partitioning(c_partition, c_replication_factor)
+    a_p = get_partitioning(a_partition, replication_factor)
+    b_p = get_partitioning(b_partition, replication_factor)
+    c_p = get_partitioning(c_partition, replication_factor)
 
     global_a = torch.randn(m, k, dtype=torch.float32, device=device)*50 + 50
     global_b = torch.randn(k, n, dtype=torch.float32, device=device)*50 + 50
@@ -78,6 +87,10 @@ def run_matmul_benchmark(m: int, n: int, k: int, a_partition: str, b_partition: 
     dt_c = distribute_tensor(global_c, *c_p)
 
     dt.init_scratch(k * n, dt_b.dtype)
+
+    if rank == 0:
+        print(f'Multiply A {dt_a.shape} by B {dt_b.shape} -> C {dt_c.shape}')
+        print(f'Tile grids are A {dt.grid_shape(dt_a)}, B {dt.grid_shape(dt_b)}, and C {dt.grid_shape(dt_c)}')
 
     n_iterations = 10
 
@@ -135,6 +148,50 @@ def run_matmul_benchmark(m: int, n: int, k: int, a_partition: str, b_partition: 
     nvshmem.finalize()
     dist.destroy_process_group()
 
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Distributed matrix multiplication example")
+    parser.add_argument("--m", type=int, default=8 * 1024, help="Number of rows in matrix A")
+    parser.add_argument("--n", type=int, default=8 * 1024, help="Number of columns in matrix B")
+    parser.add_argument("--k", type=int, default=8 * 1024, help="Number of columns in A / rows in B")
+    parser.add_argument(
+        "--a-partition",
+        type=str,
+        choices=["row", "column", "block"],
+        default="row",
+        help="Partitioning strategy for matrix A",
+    )
+    parser.add_argument(
+        "--b-partition",
+        type=str,
+        choices=["row", "column", "block"],
+        default="row",
+        help="Partitioning strategy for matrix B",
+    )
+    parser.add_argument(
+        "--c-partition",
+        type=str,
+        choices=["row", "column", "block"],
+        default="row",
+        help="Partitioning strategy for matrix C",
+    )
+    parser.add_argument(
+        "--replication",
+        type=int,
+        default=1,
+        help="Replication factor for A, B, and C",
+    )
+    args = parser.parse_args()
+
+    run_matmul_benchmark(
+        args.m,
+        args.n,
+        args.k,
+        args.a_partition,
+        args.b_partition,
+        args.c_partition,
+        args.replication,
+    )
+
+
 if __name__ == "__main__":
-    m = n = k = 8192
-    run_matmul_benchmark(m, n, k, 'row', 'row', 'row', 1, 1, 1)
+    main()

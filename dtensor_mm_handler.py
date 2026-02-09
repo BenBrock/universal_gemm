@@ -115,17 +115,6 @@ def _addmm_out_handler(
             f"aten.addmm.out handler shape mismatch: a.shape={tuple(a.shape)}, "
             f"b.shape={tuple(b.shape)}, c.shape={tuple(c.shape)}")
 
-    for name, t in (("a", a), ("b", b), ("out", c)):
-        if not (
-            t.device_mesh.ndim == 1
-            and len(t.placements) == 1
-            and isinstance(t.placements[0], Shard)
-            and t.placements[0].dim == 0
-        ):
-            raise RuntimeError(
-                f"NotImplemented: aten.addmm.out handler expects {name} to be row-sharded on a 1D mesh"
-            )
-
     dt.execute_stationary_c(a, b, c)
 
 

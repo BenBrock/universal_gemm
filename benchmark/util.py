@@ -69,7 +69,7 @@ def two_dimensional_partitioning(process_grid=None, replication_factor=1, mesh_t
     processes_per_replica = world_size // replication_factor
 
     if process_grid == None:
-        process_grid = util.closest_factors(processes_per_replica)
+        process_grid = closest_factors(processes_per_replica)
 
     mesh_structure = torch.arange(world_size).reshape((replication_factor, *process_grid))
 
