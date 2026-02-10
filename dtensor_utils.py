@@ -116,6 +116,25 @@ def grid_shape(dt: DTensor) -> tuple[int, int]:
     return (grid_rows, grid_cols)
 
 
+def replication_factor(dt: DTensor) -> int:
+    """
+    Return the number of logical replicas of a DTensor.
+
+    Replication factor is the product of mesh sizes for all Replicate placements.
+    Shard and Partial placements do not increase the replica count.
+    """
+    factor = 1
+    mesh = dt.device_mesh
+    for mesh_dim, placement in enumerate(dt.placements):
+        if isinstance(placement, Replicate):
+            factor *= mesh.size(mesh_dim)
+        elif isinstance(placement, (Shard, Partial)):
+            continue
+        else:
+            raise ValueError(f"replication_factor does not support placement {placement}")
+    return factor
+
+
 def tile_shape(dt: DTensor, coord: tuple[int, int] | None = None) -> tuple[int, int]:
     """
     Return the tile shape for a 2D DTensor.
