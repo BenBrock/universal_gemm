@@ -141,10 +141,23 @@ def run_matmul_benchmark(
 
         print(f"Median speedup is {np.median(all_gflops) / np.median(reference_gflops)} over a single GPU.")
 
+    # Collective, ordered teardown to avoid finalizing NVSHMEM while peers still hold/use buffers.
+    dist.barrier()
+    nvshmem.barrier_all(stream=stream)
+    torch.cuda.current_stream().synchronize()
+
     nvshmem.free_tensor(dt_a.nvshmem_base())
     nvshmem.free_tensor(dt_b.nvshmem_base())
     nvshmem.free_tensor(dt_c.nvshmem_base())
     dt.free_get_tile_scratch()
+    dtensor_mm_handler.disable()
+
+    # Ensure all ranks complete frees before NVSHMEM finalize.
+    dist.barrier()
+    nvshmem.barrier_all(stream=stream)
+    torch.cuda.current_stream().synchronize()
+
+    del full_c, dt_a, dt_b, dt_c
     nvshmem.finalize()
     dist.destroy_process_group()
 

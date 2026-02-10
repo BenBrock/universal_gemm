@@ -211,6 +211,30 @@ def tile_rank(dt: DTensor, coord: tuple[int, int]) -> int:
     return int(mesh.mesh[tuple(full_coord)].item())
 
 
+def intersect_1d(a: Slice1D, b: Slice1D) -> Slice1D:
+    start = max(a.start, b.start)
+    stop = min(a.stop, b.stop)
+    if stop < start:
+        stop = start
+    return Slice1D(start, stop)
+
+
+def intersect_2d(a: Slice2D, b: Slice2D) -> Slice2D:
+    return Slice2D(intersect_1d(a.rows, b.rows), intersect_1d(a.cols, b.cols))
+
+
+def tile_offset(dt: DTensor, coord: tuple[int, int]) -> tuple[int, int]:
+    bounds = tile_bounds(dt, coord)
+    return (bounds.rows.start, bounds.cols.start)
+
+
+def subtract_offset(region: Slice2D, offset: tuple[int, int]) -> Slice2D:
+    return Slice2D(
+        rows=Slice1D(region.rows.start - offset[0], region.rows.stop - offset[0]),
+        cols=Slice1D(region.cols.start - offset[1], region.cols.stop - offset[1]),
+    )
+
+
 def get_tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:
     """
     Copy a (possibly remote) DTensor tile into a local NVSHMEM tensor.
