@@ -177,10 +177,49 @@ def _unflatten_index(index: int, sizes: list[int]) -> list[int]:
     return coords
 
 
-def tile_rank(dt: DTensor, coord: tuple[int, int]) -> int:
+def _flatten_index(coords: list[int], sizes: list[int]) -> int:
+    if len(coords) != len(sizes):
+        raise ValueError(f"coords/sizes length mismatch: {len(coords)} != {len(sizes)}")
+    index = 0
+    for c, size in zip(coords, sizes):
+        if c < 0 or c >= size:
+            raise ValueError(f"coordinate {c} out of range for size {size}")
+        index = index * size + c
+    return index
+
+
+def _replicate_mesh_dims(dt: DTensor) -> list[int]:
+    return [
+        mesh_dim
+        for mesh_dim, placement in enumerate(dt.placements)
+        if isinstance(placement, Replicate)
+    ]
+
+
+def my_replica(dt: DTensor) -> int:
+    """
+    Return the replica index associated with the calling process.
+
+    If dt is not replicated, returns 0.
+    """
+    rep_dims = _replicate_mesh_dims(dt)
+    if not rep_dims:
+        return 0
+
+    coord = dt.device_mesh.get_coordinate()
+    if coord is None:
+        raise RuntimeError("Current rank is not part of the DTensor device mesh")
+
+    rep_sizes = [dt.device_mesh.size(d) for d in rep_dims]
+    rep_coords = [coord[d] for d in rep_dims]
+    return _flatten_index(rep_coords, rep_sizes)
+
+
+def tile_rank(dt: DTensor, coord: tuple[int, int], replica: int | None = None) -> int:
     placements = dt.placements
     mesh = dt.device_mesh
 
+    rep_dims = _replicate_mesh_dims(dt)
     row_dims = [
         mesh_dim
         for mesh_dim, placement in enumerate(placements)
@@ -192,30 +231,24 @@ def tile_rank(dt: DTensor, coord: tuple[int, int]) -> int:
         if isinstance(placement, Shard) and placement.dim == 1
     ]
 
-    if mesh.ndim == 1:
-        shard_dim = None
-        if row_dims:
-            shard_dim = 0
-            tile_index = coord[0]
-            shard_sizes = [mesh.size(d) for d in row_dims]
-        elif col_dims:
-            shard_dim = 1
-            tile_index = coord[1]
-            shard_sizes = [mesh.size(d) for d in col_dims]
-        else:
-            shard_dim = None
-            tile_index = 0
-            shard_sizes = [mesh.size(0)]
-
-        if shard_dim is None:
-            owner_index = 0
-        else:
-            owner_index = _unflatten_index(tile_index, shard_sizes)[0]
-
-        mesh_tensor = mesh.mesh.flatten()
-        return int(mesh_tensor[owner_index].item())
-
     full_coord = [0] * mesh.ndim
+    if replica is None:
+        replica = my_replica(dt)
+
+    rep_sizes = [mesh.size(d) for d in rep_dims]
+    rep_factor = 1
+    for s in rep_sizes:
+        rep_factor *= s
+    if replica < 0 or replica >= rep_factor:
+        raise ValueError(
+            f"replica {replica} out of range for replication_factor {rep_factor}"
+        )
+
+    if rep_dims:
+        rep_coords = _unflatten_index(replica, rep_sizes)
+        for d, c in zip(rep_dims, rep_coords):
+            full_coord[d] = c
+
     if row_dims:
         row_sizes = [mesh.size(d) for d in row_dims]
         row_coords = _unflatten_index(coord[0], row_sizes)
@@ -254,7 +287,7 @@ def subtract_offset(region: Slice2D, offset: tuple[int, int]) -> Slice2D:
     )
 
 
-def get_tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:
+def get_tile(dt: DTensor, coord: tuple[int, int], replica: int | None = None) -> torch.Tensor:
     """
     Copy a (possibly remote) DTensor tile into a local NVSHMEM tensor.
     Returns a view clipped to the precise tile shape for coord.
@@ -271,12 +304,13 @@ def get_tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:
 
     max_shape = tile_shape(dt)
     actual_shape = tile_shape(dt, coord)
-    owner_rank = tile_rank(dt, coord)
+    owner_rank = tile_rank(dt, coord, replica=replica)
 
     heap = _get_tile_heap(dt)
     scratch = heap.alloc(max_shape)
     src = dt.nvshmem_base().view(max_shape)
     stream = torch.cuda.current_stream()
+    print(f'      => Rank {dist.get_rank()} getting tile from rank {owner_rank}...')
     nvshmem.get(scratch._nvshmem_buf, src, remote_pe=owner_rank, stream=stream)
     nvshmem.quiet(stream)
     stream.synchronize()
@@ -284,7 +318,7 @@ def get_tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:
     return scratch[:rows, :cols]
 
 
-def tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:
+def tile(dt: DTensor, coord: tuple[int, int], replica: int | None = None) -> torch.Tensor:
     """
     Return a local view of the tile if owned by the calling rank.
     Raises if the tile is remote.
@@ -292,7 +326,7 @@ def tile(dt: DTensor, coord: tuple[int, int]) -> torch.Tensor:
     if dt.ndim != 2:
         raise ValueError(f"tile expects a 2D DTensor, got ndim={dt.ndim}")
 
-    owner_rank = tile_rank(dt, coord)
+    owner_rank = tile_rank(dt, coord, replica=replica)
     rank = dist.get_rank() if dist.is_initialized() else 0
     if owner_rank != rank:
         raise RuntimeError(
@@ -332,7 +366,9 @@ class _TileFuture:
         return view
 
 
-def get_tile_async(dt: DTensor, coord: tuple[int, int]) -> _TileFuture:
+def get_tile_async(
+    dt: DTensor, coord: tuple[int, int], replica: int | None = None
+) -> _TileFuture:
     """
     Asynchronously fetch a tile. Returns a future with a .get() method.
     """
@@ -348,7 +384,7 @@ def get_tile_async(dt: DTensor, coord: tuple[int, int]) -> _TileFuture:
 
     max_shape = tile_shape(dt)
     rows, cols = tile_shape(dt, coord)
-    owner_rank = tile_rank(dt, coord)
+    owner_rank = tile_rank(dt, coord, replica=replica)
 
     heap = _get_tile_heap(dt)
     scratch = heap.alloc(max_shape)
