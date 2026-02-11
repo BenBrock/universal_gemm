@@ -6,6 +6,7 @@ from cuda.core.experimental._stream import Stream
 
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
+import accumulate_kernels
 from dtensor_scratch import NvshmemHeap
 from tile_bounds import Slice1D, Slice2D, overlapping_tiles, tile_bounds
 from stationary_c_plan import (
@@ -310,7 +311,6 @@ def get_tile(dt: DTensor, coord: tuple[int, int], replica: int | None = None) ->
     scratch = heap.alloc(max_shape)
     src = dt.nvshmem_base().view(max_shape)
     stream = torch.cuda.current_stream()
-    print(f'      => Rank {dist.get_rank()} getting tile from rank {owner_rank}...')
     nvshmem.get(scratch._nvshmem_buf, src, remote_pe=owner_rank, stream=stream)
     nvshmem.quiet(stream)
     stream.synchronize()
@@ -366,6 +366,14 @@ class _TileFuture:
         return view
 
 
+class _AccumulateFuture:
+    def __init__(self, event: torch.cuda.Event) -> None:
+        self._event = event
+
+    def wait(self) -> None:
+        self._event.synchronize()
+
+
 def get_tile_async(
     dt: DTensor, coord: tuple[int, int], replica: int | None = None
 ) -> _TileFuture:
@@ -392,3 +400,95 @@ def get_tile_async(
     src = dt.nvshmem_base().view(max_shape)
     nvshmem.get(scratch._nvshmem_buf, src, remote_pe=owner_rank, stream=nvshmem_stream)
     return _TileFuture(scratch, nvshmem_stream, rows, cols)
+
+
+def accumulate_tile(
+    dt: DTensor,
+    coord: tuple[int, int],
+    view: torch.Tensor,
+    *,
+    slice_: Slice2D | None = None,
+    replica: int | None = None,
+) -> _AccumulateFuture:
+    """
+    Asynchronously accumulate `view` into a local/remote DTensor tile slice.
+
+    This API is one-sided and non-collective:
+      - local tile owner path updates local memory directly
+      - remote tile owner path maps peer memory with nvshmem.get_peer_tensor(...)
+        and uses atomic add on that mapped pointer
+    """
+    if dt.ndim != 2:
+        raise ValueError(f"accumulate_tile expects a 2D DTensor, got ndim={dt.ndim}")
+    if view.ndim != 2:
+        raise ValueError(f"accumulate_tile expects a rank-2 view, got ndim={view.ndim}")
+    if dt.device.type != "cuda" or view.device.type != "cuda":
+        raise RuntimeError("accumulate_tile currently supports CUDA tensors only")
+    if view.dtype != dt.dtype:
+        raise RuntimeError(
+            f"accumulate_tile dtype mismatch: view={view.dtype}, dt={dt.dtype}"
+        )
+    if view.dtype != torch.float32:
+        raise RuntimeError(
+            f"accumulate_tile currently supports torch.float32 only, got {view.dtype}"
+        )
+    if not accumulate_kernels.is_available():
+        raise RuntimeError(
+            "accumulate_tile requires Triton, but Triton is unavailable in this environment"
+        )
+
+    grid_rows, grid_cols = grid_shape(dt)
+    row_idx, col_idx = coord
+    if not (0 <= row_idx < grid_rows and 0 <= col_idx < grid_cols):
+        raise ValueError(
+            f"tile coord {coord} out of range for grid {(grid_rows, grid_cols)}"
+        )
+
+    tile_rows, tile_cols = tile_shape(dt, coord)
+    if slice_ is None:
+        slice_ = Slice2D(Slice1D(0, tile_rows), Slice1D(0, tile_cols))
+
+    if slice_.rows.stop > tile_rows or slice_.cols.stop > tile_cols:
+        raise ValueError(
+            f"slice {slice_} out of bounds for tile shape {(tile_rows, tile_cols)}"
+        )
+    if view.shape != slice_.shape:
+        raise ValueError(
+            f"view shape {tuple(view.shape)} does not match slice shape {slice_.shape}"
+        )
+
+    owner_rank = tile_rank(dt, coord, replica=replica)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
+    max_shape = tile_shape(dt)
+    raw_base = dt.nvshmem_base()
+    is_nvshmem_backed = bool(getattr(raw_base, "_nvshmem_alloc", False))
+    local_base = raw_base.view(max_shape)
+    if owner_rank == rank:
+        dst_base = local_base
+    else:
+        if not is_nvshmem_backed:
+            raise RuntimeError(
+                "accumulate_tile remote updates require NVSHMEM-backed DTensor storage "
+                "(set TORCH_DTENSOR_USE_NVSHMEM=1 before constructing DTensors)"
+            )
+        try:
+            dst_base = nvshmem.get_peer_tensor(local_base, owner_rank).view(max_shape)
+        except Exception as exc:
+            raise RuntimeError(
+                "accumulate_tile failed to map remote tile memory with "
+                "nvshmem.get_peer_tensor; this path requires single-node GPU P2P access"
+            ) from exc
+
+    dst_view = dst_base[*slice_.as_slices()]
+    if dst_view.shape != view.shape:
+        raise RuntimeError(
+            f"internal accumulate_tile shape mismatch: dst={tuple(dst_view.shape)} "
+            f"view={tuple(view.shape)}"
+        )
+
+    accumulate_kernels.launch_atomic_add(dst_view, view)
+
+    event = torch.cuda.Event()
+    event.record(torch.cuda.current_stream())
+    return _AccumulateFuture(event)

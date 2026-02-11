@@ -88,41 +88,6 @@ def run_matmul_benchmark(
 
     dt.init_scratch(2 * k * n, dt_b.dtype)
 
-    for r in range(dist.get_world_size()):
-        dist.barrier()
-        if rank == r:
-            print(f'Rank {rank} has replica {dt.my_replica(dt_a)},{dt.my_replica(dt_b)},{dt.my_replica(dt_c)} of A,B,C')
-
-            for tens,symb in zip([dt_a, dt_b, dt_c], ['A', 'B', 'C']):
-                print(f'  Distribution for {symb}:')
-                for i in range(dt.grid_shape(tens)[0]):
-                    for j in range(dt.grid_shape(tens)[1]):
-                        print(f'    {(i,j)} is on rank {dt.tile_rank(tens, (i,j))}')
-                        tile = dt.get_tile(tens, (i,j))
-                        dt.release_tile(tile)
-
-
-    # Collective, ordered teardown to avoid finalizing NVSHMEM while peers still hold/use buffers.
-    dist.barrier()
-    nvshmem.barrier_all(stream=stream)
-    torch.cuda.current_stream().synchronize()
-
-    nvshmem.free_tensor(dt_a.nvshmem_base())
-    nvshmem.free_tensor(dt_b.nvshmem_base())
-    nvshmem.free_tensor(dt_c.nvshmem_base())
-    dt.free_get_tile_scratch()
-    dtensor_mm_handler.disable()
-
-    # Ensure all ranks complete frees before NVSHMEM finalize.
-    dist.barrier()
-    nvshmem.barrier_all(stream=stream)
-    torch.cuda.current_stream().synchronize()
-
-    del dt_a, dt_b, dt_c
-    nvshmem.finalize()
-    dist.destroy_process_group()
-    return
-
     if rank == 0:
         print(f'Multiply A {dt_a.shape} by B {dt_b.shape} -> C {dt_c.shape}')
         print(f'Tile grids are A {dt.grid_shape(dt_a)}, B {dt.grid_shape(dt_b)}, and C {dt.grid_shape(dt_c)}')
