@@ -271,6 +271,10 @@ def execute_stationary_c(
     )
 
     if c_rep_factor > 1:
+        # Ensure all ranks finish local compute before any one-sided replica
+        # reduction starts writing into origin replica storage.
+        if dist.is_initialized():
+            dist.barrier()
         dt.reduce_replicas(c)
         # Wait for all source replicas to complete one-sided updates before
         # proceeding to subsequent iterations/uses of C.

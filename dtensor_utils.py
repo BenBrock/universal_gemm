@@ -306,6 +306,13 @@ def get_tile(dt: DTensor, coord: tuple[int, int], replica: int | None = None) ->
     max_shape = tile_shape(dt)
     actual_shape = tile_shape(dt, coord)
     owner_rank = tile_rank(dt, coord, replica=replica)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
+    # Fast path for local ownership: avoid scratch allocation and NVSHMEM get.
+    if owner_rank == rank:
+        rows, cols = actual_shape
+        local = dt.to_local()
+        return local[:rows, :cols]
 
     heap = _get_tile_heap(dt)
     scratch = heap.alloc(max_shape)
