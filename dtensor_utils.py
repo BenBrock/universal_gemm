@@ -374,6 +374,15 @@ class _AccumulateFuture:
         self._event.synchronize()
 
 
+class _ReduceReplicasFuture:
+    def __init__(self, futures: list[_AccumulateFuture]) -> None:
+        self._futures = futures
+
+    def wait(self) -> None:
+        for fut in self._futures:
+            fut.wait()
+
+
 def get_tile_async(
     dt: DTensor, coord: tuple[int, int], replica: int | None = None
 ) -> _TileFuture:
@@ -492,3 +501,62 @@ def accumulate_tile(
     event = torch.cuda.Event()
     event.record(torch.cuda.current_stream())
     return _AccumulateFuture(event)
+
+
+def reduce_replicas_async(
+    dt: DTensor,
+    *,
+    origin_replica: int = 0,
+) -> _ReduceReplicasFuture:
+    """
+    Reduce all replicas into `origin_replica` using one-sided accumulate_tile updates.
+
+    This helper is collective-by-convention: all ranks in the DTensor mesh should
+    call it. Each non-origin replica owner pushes its local tile to the
+    corresponding tile in `origin_replica`.
+    """
+    if dt.ndim != 2:
+        raise ValueError(f"reduce_replicas_async expects a 2D DTensor, got ndim={dt.ndim}")
+
+    rep_factor = replication_factor(dt)
+    if rep_factor <= 1:
+        return _ReduceReplicasFuture([])
+    if origin_replica < 0 or origin_replica >= rep_factor:
+        raise ValueError(
+            f"origin_replica {origin_replica} out of range for replication_factor {rep_factor}"
+        )
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    rows, cols = grid_shape(dt)
+    futures: list[_AccumulateFuture] = []
+
+    for replica_idx in range(rep_factor):
+        if replica_idx == origin_replica:
+            continue
+        for i in range(rows):
+            for j in range(cols):
+                coord = (i, j)
+                owner = tile_rank(dt, coord, replica=replica_idx)
+                if owner != rank:
+                    continue
+                src_tile = tile(dt, coord, replica=replica_idx)
+                futures.append(
+                    accumulate_tile(
+                        dt,
+                        coord,
+                        src_tile,
+                        replica=origin_replica,
+                    )
+                )
+    return _ReduceReplicasFuture(futures)
+
+
+def reduce_replicas(
+    dt: DTensor,
+    *,
+    origin_replica: int = 0,
+) -> None:
+    """
+    Synchronous wrapper over reduce_replicas_async.
+    """
+    reduce_replicas_async(dt, origin_replica=origin_replica).wait()

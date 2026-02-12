@@ -41,6 +41,54 @@ def format_plan(ops: list[MultiplyOp], rank: int | None = None) -> str:
     return "\n".join(lines)
 
 
+def _rotated_replica_k_ranges(
+    *,
+    k_extent: int,
+    rep_factor: int,
+    replica_idx: int,
+    tile_sum_idx: int,
+    k_tile_width: int,
+) -> list[Slice1D]:
+    """
+    Return this replica's K ranges for a stationary tile after applying
+    tile-dependent rotation.
+
+    The unrotated base chunk is:
+      [chunk_size * replica_idx, min(k_extent, chunk_size * (replica_idx + 1)))
+    where chunk_size = ceil(k_extent / rep_factor).
+
+    We then rotate this interval by:
+      offset = (tile_sum_idx * k_tile_width) % k_extent
+
+    Rotation is done on a ring [0, k_extent), so the result may wrap and split
+    into two ranges.
+    """
+    if k_extent <= 0:
+        return []
+    if rep_factor <= 0:
+        raise ValueError(f"rep_factor must be positive, got {rep_factor}")
+    if replica_idx < 0 or replica_idx >= rep_factor:
+        raise ValueError(
+            f"replica_idx {replica_idx} out of range for rep_factor {rep_factor}"
+        )
+    if k_tile_width <= 0:
+        raise ValueError(f"k_tile_width must be positive, got {k_tile_width}")
+
+    chunk_size = (k_extent + rep_factor - 1) // rep_factor
+    base_start = chunk_size * replica_idx
+    base_stop = min(k_extent, chunk_size * (replica_idx + 1))
+    base_len = max(base_stop - base_start, 0)
+    if base_len == 0:
+        return []
+
+    offset = (tile_sum_idx * k_tile_width) % k_extent
+    start = (base_start + offset) % k_extent
+    stop = start + base_len
+    if stop <= k_extent:
+        return [Slice1D(start, stop)]
+    return [Slice1D(start, k_extent), Slice1D(0, stop - k_extent)]
+
+
 def build_stationary_c_ops(
     a: DTensor,
     b: DTensor,
@@ -50,6 +98,10 @@ def build_stationary_c_ops(
 ) -> list[MultiplyOp]:
     """
     Build the Stationary-C local multiply-operation list (Algorithm 1).
+
+    If C is replicated with factor r>1, each replica computes only a contiguous
+    1/r chunk of the global K dimension, keyed by my_replica(c). This mirrors
+    replicated stationary-C chunking in drc_matrix.
     """
     if not (a.ndim == 2 and b.ndim == 2 and c.ndim == 2):
         raise ValueError("build_stationary_c_ops expects rank-2 DTensors for a, b, and c")
@@ -61,6 +113,11 @@ def build_stationary_c_ops(
 
     rank = dist.get_rank() if dist.is_initialized() else 0
     c_grid_rows, c_grid_cols = dt.grid_shape(c)
+    c_rep_factor = dt.replication_factor(c)
+    c_replica = dt.my_replica(c)
+
+    k_extent = int(a.shape[1])
+    k_tile_width = dt.tile_shape(a)[1]
 
     ops: list[MultiplyOp] = []
 
@@ -71,42 +128,53 @@ def build_stationary_c_ops(
                 continue
 
             c_bounds = tile_bounds(c, c_idx)
-            a_region = Slice2D(c_bounds.rows, Slice1D(0, int(a.shape[1])))
-            a_tiles = overlapping_tiles(a, a_region)
+            k_ranges = _rotated_replica_k_ranges(
+                k_extent=k_extent,
+                rep_factor=c_rep_factor,
+                replica_idx=c_replica,
+                tile_sum_idx=i + j,
+                k_tile_width=k_tile_width,
+            )
 
-            for a_idx in a_tiles:
-                a_bounds = tile_bounds(a, a_idx)
-                b_region = Slice2D(a_bounds.cols, c_bounds.cols)
-                b_tiles = overlapping_tiles(b, b_region)
+            for k_bounds_for_tile in k_ranges:
+                a_region = Slice2D(c_bounds.rows, k_bounds_for_tile)
+                a_tiles = overlapping_tiles(a, a_region)
 
-                for b_idx in b_tiles:
-                    b_bounds = tile_bounds(b, b_idx)
+                for a_idx in a_tiles:
+                    # Clip the A tile bounds to this replica's rotated K chunk
+                    # so straddling tiles do not generate out-of-chunk work.
+                    a_bounds = dt.intersect_2d(tile_bounds(a, a_idx), a_region)
+                    b_region = Slice2D(a_bounds.cols, c_bounds.cols)
+                    b_tiles = overlapping_tiles(b, b_region)
 
-                    m_bounds = dt.intersect_1d(a_bounds.rows, c_bounds.rows)
-                    k_bounds = dt.intersect_1d(a_bounds.cols, b_bounds.rows)
-                    n_bounds = dt.intersect_1d(b_bounds.cols, c_bounds.cols)
+                    for b_idx in b_tiles:
+                        b_bounds = tile_bounds(b, b_idx)
 
-                    global_a = Slice2D(m_bounds, k_bounds)
-                    global_b = Slice2D(k_bounds, n_bounds)
-                    global_c = Slice2D(m_bounds, n_bounds)
+                        m_bounds = dt.intersect_1d(a_bounds.rows, c_bounds.rows)
+                        k_bounds = dt.intersect_1d(a_bounds.cols, b_bounds.rows)
+                        n_bounds = dt.intersect_1d(b_bounds.cols, c_bounds.cols)
 
-                    if global_a.shape[0] == 0 or global_a.shape[1] == 0:
-                        continue
-                    if global_b.shape[0] == 0 or global_b.shape[1] == 0:
-                        continue
-                    if global_c.shape[0] == 0 or global_c.shape[1] == 0:
-                        continue
+                        global_a = Slice2D(m_bounds, k_bounds)
+                        global_b = Slice2D(k_bounds, n_bounds)
+                        global_c = Slice2D(m_bounds, n_bounds)
 
-                    ops.append(
-                        MultiplyOp(
-                            a_idx=a_idx,
-                            b_idx=b_idx,
-                            c_idx=c_idx,
-                            a_slice=dt.subtract_offset(global_a, dt.tile_offset(a, a_idx)),
-                            b_slice=dt.subtract_offset(global_b, dt.tile_offset(b, b_idx)),
-                            c_slice=dt.subtract_offset(global_c, dt.tile_offset(c, c_idx)),
+                        if global_a.shape[0] == 0 or global_a.shape[1] == 0:
+                            continue
+                        if global_b.shape[0] == 0 or global_b.shape[1] == 0:
+                            continue
+                        if global_c.shape[0] == 0 or global_c.shape[1] == 0:
+                            continue
+
+                        ops.append(
+                            MultiplyOp(
+                                a_idx=a_idx,
+                                b_idx=b_idx,
+                                c_idx=c_idx,
+                                a_slice=dt.subtract_offset(global_a, dt.tile_offset(a, a_idx)),
+                                b_slice=dt.subtract_offset(global_b, dt.tile_offset(b, b_idx)),
+                                c_slice=dt.subtract_offset(global_c, dt.tile_offset(c, c_idx)),
+                            )
                         )
-                    )
     return ops
 
 
@@ -184,6 +252,15 @@ def execute_stationary_c(
     Build and execute a Stationary-C plan.
     Returns the generated op list for debugging/printing.
     """
+    import dtensor_utils as dt  # Lazy import to avoid circular import at module import time.
+
+    c_rep_factor = dt.replication_factor(c)
+    if c_rep_factor > 1 and dt.my_replica(c) != 0:
+        # We reduce partial C contributions into origin replica 0. Clear
+        # non-origin local C before each call so repeated addmm(..., out=c)
+        # does not re-add stale non-origin values across iterations.
+        c.to_local().zero_()
+
     ops = build_stationary_c_ops(a, b, c, local_only=local_only)
     execute_stationary_c_ops(
         a,
@@ -192,4 +269,11 @@ def execute_stationary_c(
         ops,
         release_remote_tiles=release_remote_tiles,
     )
+
+    if c_rep_factor > 1:
+        dt.reduce_replicas(c)
+        # Wait for all source replicas to complete one-sided updates before
+        # proceeding to subsequent iterations/uses of C.
+        if dist.is_initialized():
+            dist.barrier()
     return ops
