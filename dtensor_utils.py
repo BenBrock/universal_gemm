@@ -9,6 +9,13 @@ from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 import accumulate_kernels
 from dtensor_scratch import NvshmemHeap
 from tile_bounds import Slice1D, Slice2D, overlapping_tiles, tile_bounds
+from stationary_b_plan import (
+    build_stationary_b_ops,
+    execute_stationary_b,
+    execute_stationary_b_ops,
+    format_stationary_b_op,
+    format_stationary_b_plan,
+)
 from stationary_c_plan import (
     MultiplyOp,
     build_stationary_c_ops,
@@ -115,6 +122,15 @@ def grid_shape(dt: DTensor) -> tuple[int, int]:
             raise ValueError(f"grid_shape does not support placement {placement}")
 
     return (grid_rows, grid_cols)
+
+
+def matrix_numel(dt: DTensor) -> int:
+    """
+    Return total element count for a rank-2 DTensor.
+    """
+    if dt.ndim != 2:
+        raise ValueError(f"matrix_numel expects a 2D DTensor, got ndim={dt.ndim}")
+    return int(dt.shape[0]) * int(dt.shape[1])
 
 
 def replication_factor(dt: DTensor) -> int:
