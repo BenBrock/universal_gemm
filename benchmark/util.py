@@ -45,7 +45,7 @@ def materialized_placements(device_mesh, placements):
         elif isinstance(p, Shard):
             partial_dims.remove(p.dim)
         elif isinstance(p, Replicate):
-            partial_dims.remove(p.dim)
+            continue
 
     if has_partial:
         materialize_dim = partial_dims.pop()
