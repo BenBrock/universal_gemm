@@ -51,6 +51,11 @@ def main() -> None:
     global_a = torch.randn(m, n, dtype=torch.float32)
     dt_a = distribute_tensor(global_a, *a_p)
 
+    tile_shape = dt.tile_shape(dt_a)
+    tile_numel = tile_shape[0] * tile_shape[1]
+    tiles_per_round = dt.grid_shape(dt_a)[0] * dt.grid_shape(dt_a)[1]
+    dt.init_scratch(tile_numel * tiles_per_round, dt_a.dtype)
+
     if rank == 0:
         grid = dt.grid_shape(dt_a)
         futures = []
@@ -66,7 +71,9 @@ def main() -> None:
             )
             print(f"tile ({i}, {j}) ok: {tuple(tile.shape)}")
 
+    dist.barrier()
     nvshmem.free_tensor(dt_a.nvshmem_base())
+    dt.free_get_tile_scratch()
     nvshmem.finalize()
     dist.destroy_process_group()
 

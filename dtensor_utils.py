@@ -394,17 +394,24 @@ def release_tile(tile: torch.Tensor) -> None:
 class _TileFuture:
     def __init__(
         self,
-        scratch: torch.Tensor,
-        nvshmem_stream: nvshmem.nvshmem_types.NvshmemStream,
+        scratch: torch.Tensor | None,
+        nvshmem_stream: nvshmem.nvshmem_types.NvshmemStream | None,
         rows: int,
         cols: int,
+        *,
+        local_view: torch.Tensor | None = None,
     ) -> None:
         self._scratch = scratch
         self._nvshmem_stream = nvshmem_stream
         self._rows = rows
         self._cols = cols
+        self._local_view = local_view
 
     def get(self) -> torch.Tensor:
+        if self._local_view is not None:
+            return self._local_view
+        if self._scratch is None or self._nvshmem_stream is None:
+            raise RuntimeError("TileFuture has no pending transfer and no local view")
         nvshmem.quiet(self._nvshmem_stream)
         self._nvshmem_stream.sync()
         view = self._scratch[: self._rows, : self._cols]
@@ -448,6 +455,13 @@ def get_tile_async(
     max_shape = tile_shape(dt)
     rows, cols = tile_shape(dt, coord)
     owner_rank = tile_rank(dt, coord, replica=replica)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
+    # Fast path for local ownership: return an immediate view and skip
+    # scratch allocation + NVSHMEM traffic.
+    if owner_rank == rank:
+        local = dt.to_local()
+        return _TileFuture(None, None, rows, cols, local_view=local[:rows, :cols])
 
     heap = _get_tile_heap(dt)
     scratch = heap.alloc(max_shape)
