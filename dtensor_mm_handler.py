@@ -116,6 +116,8 @@ def _addmm_out_handler(
             f"aten.addmm.out handler shape mismatch: a.shape={tuple(a.shape)}, "
             f"b.shape={tuple(b.shape)}, c.shape={tuple(c.shape)}")
 
+    dt.execute_stationary_c(a, b, c)
+    return
     # Select Stationary-C unless B is larger than C.
     if dt.matrix_numel(b) > dt.matrix_numel(c):
         dt.execute_stationary_b(a, b, c)

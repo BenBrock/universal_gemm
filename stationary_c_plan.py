@@ -240,6 +240,141 @@ def execute_stationary_c_ops(
         torch.cuda.current_stream().synchronize()
 
 
+def execute_stationary_c_ops_async(
+    a: DTensor,
+    b: DTensor,
+    c: DTensor,
+    ops: list[MultiplyOp],
+    *,
+    release_remote_tiles: bool = True,
+    max_outstanding_prefetch: int = 1,
+) -> None:
+    """
+    Execute a Stationary-C op list with async A/B tile prefetch.
+
+    Notes:
+      - Ops are executed in-order (no iteration offset).
+      - Prefetch is bounded by `max_outstanding_prefetch`.
+      - Retrieved tiles are cached and evicted after their final use.
+    """
+    import dtensor_utils as dt  # Lazy import to avoid circular import at module import time.
+
+    if max_outstanding_prefetch < 0:
+        raise ValueError(
+            f"max_outstanding_prefetch must be non-negative, got {max_outstanding_prefetch}"
+        )
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if not ops:
+        return
+
+    a_tile_requests: dict[tuple[int, int], object] = {}
+    b_tile_requests: dict[tuple[int, int], object] = {}
+    a_tiles: dict[tuple[int, int], torch.Tensor] = {}
+    b_tiles: dict[tuple[int, int], torch.Tensor] = {}
+
+    # Track which requests count against the outstanding prefetch budget.
+    prefetched_requests: set[tuple[str, tuple[int, int]]] = set()
+
+    # Remaining uses for each fetched tile so we can evict exactly after
+    # the final consuming op.
+    a_remaining: dict[tuple[int, int], int] = {}
+    b_remaining: dict[tuple[int, int], int] = {}
+    for op in ops:
+        a_remaining[op.a_idx] = a_remaining.get(op.a_idx, 0) + 1
+        b_remaining[op.b_idx] = b_remaining.get(op.b_idx, 0) + 1
+
+    def _select_maps(
+        matrix_name: str,
+    ) -> tuple[dict[tuple[int, int], object], dict[tuple[int, int], torch.Tensor]]:
+        if matrix_name == "a":
+            return a_tile_requests, a_tiles
+        if matrix_name == "b":
+            return b_tile_requests, b_tiles
+        raise RuntimeError(f"Unknown matrix name: {matrix_name}")
+
+    def _enqueue_tile(matrix_name: str, idx: tuple[int, int], *, prefetch: bool) -> bool:
+        requests, tiles = _select_maps(matrix_name)
+        if idx in tiles or idx in requests:
+            return False
+        matrix = a if matrix_name == "a" else b
+        requests[idx] = dt.get_tile_async(matrix, idx)
+        if prefetch:
+            prefetched_requests.add((matrix_name, idx))
+        return True
+
+    def _get_tile(matrix_name: str, idx: tuple[int, int]) -> torch.Tensor:
+        requests, tiles = _select_maps(matrix_name)
+        future = requests.pop(idx, None)
+        if future is not None:
+            tile = future.get()
+            tiles[idx] = tile
+        else:
+            tile = tiles.get(idx)
+            if tile is None:
+                # Required, non-prefetched path.
+                matrix = a if matrix_name == "a" else b
+                tile = dt.get_tile_async(matrix, idx).get()
+                tiles[idx] = tile
+        prefetched_requests.discard((matrix_name, idx))
+        return tiles[idx]
+
+    def _prefetch_for_next_op(next_op: MultiplyOp | None) -> None:
+        if next_op is None or max_outstanding_prefetch == 0:
+            return
+        for matrix_name, idx in (("a", next_op.a_idx), ("b", next_op.b_idx)):
+            if len(prefetched_requests) >= max_outstanding_prefetch:
+                break
+            _enqueue_tile(matrix_name, idx, prefetch=True)
+
+    for op_idx, op in enumerate(ops):
+        _validate_op_shapes(op)
+
+        owner = dt.tile_rank(c, op.c_idx)
+        if owner != rank:
+            raise RuntimeError(
+                f"Stationary-C async execution expected local c_idx={op.c_idx}, "
+                f"owner={owner}, rank={rank}"
+            )
+
+        a_tile = _get_tile("a", op.a_idx)
+        b_tile = _get_tile("b", op.b_idx)
+
+        next_op = ops[op_idx + 1] if op_idx + 1 < len(ops) else None
+        _prefetch_for_next_op(next_op)
+
+        c_tile = dt.tile(c, op.c_idx)
+        a_view = a_tile[*op.a_slice.as_slices()]
+        b_view = b_tile[*op.b_slice.as_slices()]
+        c_view = c_tile[*op.c_slice.as_slices()]
+        torch.addmm(c_view, a_view, b_view, out=c_view)
+
+        a_remaining[op.a_idx] -= 1
+        if a_remaining[op.a_idx] == 0:
+            tile = a_tiles.pop(op.a_idx, None)
+            if release_remote_tiles and tile is not None:
+                dt.release_tile(tile)
+
+        b_remaining[op.b_idx] -= 1
+        if b_remaining[op.b_idx] == 0:
+            tile = b_tiles.pop(op.b_idx, None)
+            if release_remote_tiles and tile is not None:
+                dt.release_tile(tile)
+
+    # Drain any leftover prefetched requests before returning.
+    for idx, future in a_tile_requests.items():
+        tile = future.get()
+        if release_remote_tiles:
+            dt.release_tile(tile)
+    for idx, future in b_tile_requests.items():
+        tile = future.get()
+        if release_remote_tiles:
+            dt.release_tile(tile)
+
+    if c.device.type == "cuda":
+        torch.cuda.current_stream().synchronize()
+
+
 def execute_stationary_c(
     a: DTensor,
     b: DTensor,
@@ -247,12 +382,15 @@ def execute_stationary_c(
     *,
     local_only: bool = True,
     release_remote_tiles: bool = True,
+    use_async: bool | None = None,
+    max_outstanding_prefetch: int = 1,
 ) -> list[MultiplyOp]:
     """
     Build and execute a Stationary-C plan.
     Returns the generated op list for debugging/printing.
     """
     import dtensor_utils as dt  # Lazy import to avoid circular import at module import time.
+    import os
 
     c_rep_factor = dt.replication_factor(c)
     if c_rep_factor > 1 and dt.my_replica(c) != 0:
@@ -262,13 +400,25 @@ def execute_stationary_c(
         c.to_local().zero_()
 
     ops = build_stationary_c_ops(a, b, c, local_only=local_only)
-    execute_stationary_c_ops(
-        a,
-        b,
-        c,
-        ops,
-        release_remote_tiles=release_remote_tiles,
-    )
+    if use_async is None:
+        use_async = True
+    if use_async:
+        execute_stationary_c_ops_async(
+            a,
+            b,
+            c,
+            ops,
+            release_remote_tiles=release_remote_tiles,
+            max_outstanding_prefetch=max_outstanding_prefetch,
+        )
+    else:
+        execute_stationary_c_ops(
+            a,
+            b,
+            c,
+            ops,
+            release_remote_tiles=release_remote_tiles,
+        )
 
     if c_rep_factor > 1:
         # Ensure all ranks finish local compute before any one-sided replica

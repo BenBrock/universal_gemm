@@ -21,6 +21,7 @@ from stationary_c_plan import (
     build_stationary_c_ops,
     execute_stationary_c,
     execute_stationary_c_ops,
+    execute_stationary_c_ops_async,
     format_op,
     format_plan,
 )
