@@ -13,6 +13,7 @@ from stationary_b_plan import (
     build_stationary_b_ops,
     execute_stationary_b,
     execute_stationary_b_ops,
+    execute_stationary_b_ops_async,
     format_stationary_b_op,
     format_stationary_b_plan,
 )

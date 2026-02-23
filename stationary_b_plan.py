@@ -1,4 +1,5 @@
 from stationary_c_plan import MultiplyOp
+from collections import deque
 
 import torch
 import torch.distributed as dist
@@ -203,6 +204,172 @@ def execute_stationary_b_ops(
         torch.cuda.current_stream().synchronize()
 
 
+def execute_stationary_b_ops_async(
+    a: DTensor,
+    b: DTensor,
+    c: DTensor,
+    ops: list[MultiplyOp],
+    *,
+    release_remote_tiles: bool = True,
+    max_outstanding_prefetch: int = 1,
+    max_outstanding_accumulates: int = 4,
+    num_compute_streams: int = 2,
+) -> None:
+    """
+    Execute a Stationary-B op list with async A-tile prefetch.
+
+    Each op is issued on a stream from a round-robin pool, and both GEMM and
+    accumulate for that op run on the same stream. This permits overlap across
+    independent op streams.
+    """
+    import dtensor_utils as dt  # Lazy import to avoid circular import at module import time.
+
+    if max_outstanding_prefetch < 0:
+        raise ValueError(
+            f"max_outstanding_prefetch must be non-negative, got {max_outstanding_prefetch}"
+        )
+    if max_outstanding_accumulates <= 0:
+        raise ValueError(
+            "max_outstanding_accumulates must be positive, "
+            f"got {max_outstanding_accumulates}"
+        )
+    if num_compute_streams <= 0:
+        raise ValueError(
+            f"num_compute_streams must be positive, got {num_compute_streams}"
+        )
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if not ops:
+        return
+
+    a_tile_requests: dict[tuple[int, int], object] = {}
+    a_tiles: dict[tuple[int, int], torch.Tensor] = {}
+
+    # Track requests that consume prefetch budget.
+    prefetched_requests: set[tuple[int, int]] = set()
+
+    # Keep outstanding accumulate futures alive with their product buffers.
+    outstanding_accumulates: deque[tuple[object, tuple[int, int], torch.Tensor]] = deque()
+
+    a_remaining: dict[tuple[int, int], int] = {}
+    for op in ops:
+        a_remaining[op.a_idx] = a_remaining.get(op.a_idx, 0) + 1
+
+    compute_streams: list[torch.cuda.Stream] = []
+    if c.device.type == "cuda":
+        compute_streams = [torch.cuda.Stream(device=c.device) for _ in range(num_compute_streams)]
+
+    def _enqueue_a(idx: tuple[int, int], *, prefetch: bool) -> bool:
+        if idx in a_tiles or idx in a_tile_requests:
+            return False
+        a_tile_requests[idx] = dt.get_tile_async(a, idx)
+        if prefetch:
+            prefetched_requests.add(idx)
+        return True
+
+    def _materialize_a(idx: tuple[int, int]) -> torch.Tensor:
+        future = a_tile_requests.pop(idx, None)
+        if future is not None:
+            a_tile = future.get()
+            # Remote get_tile_async uses pooled scratch. Clone so cached tiles are
+            # independent from scratch reuse while later GEMMs are still in flight.
+            if dt.tile_rank(a, idx) != rank:
+                a_tile = a_tile.clone()
+            a_tiles[idx] = a_tile
+        else:
+            a_tile = a_tiles.get(idx)
+            if a_tile is None:
+                a_tile = dt.get_tile_async(a, idx).get()
+                if dt.tile_rank(a, idx) != rank:
+                    a_tile = a_tile.clone()
+                a_tiles[idx] = a_tile
+        prefetched_requests.discard(idx)
+        return a_tiles[idx]
+
+    def _prefetch_next(next_op: MultiplyOp | None) -> None:
+        if next_op is None or max_outstanding_prefetch == 0:
+            return
+        if len(prefetched_requests) >= max_outstanding_prefetch:
+            return
+        _enqueue_a(next_op.a_idx, prefetch=True)
+
+    def _evict_a_if_dead(a_idx: tuple[int, int]) -> None:
+        if a_remaining[a_idx] != 0:
+            return
+        for _, in_flight_a_idx, _ in outstanding_accumulates:
+            if in_flight_a_idx == a_idx:
+                return
+        tile = a_tiles.pop(a_idx, None)
+        if release_remote_tiles and tile is not None:
+            dt.release_tile(tile)
+
+    for op_idx, op in enumerate(ops):
+        _validate_op_shapes(op)
+
+        owner = dt.tile_rank(b, op.b_idx)
+        if owner != rank:
+            raise RuntimeError(
+                f"Stationary-B async execution expected local b_idx={op.b_idx}, "
+                f"owner={owner}, rank={rank}"
+            )
+
+        a_tile = _materialize_a(op.a_idx)
+        next_op = ops[op_idx + 1] if op_idx + 1 < len(ops) else None
+        _prefetch_next(next_op)
+
+        b_tile = dt.tile(b, op.b_idx)
+
+        a_view = a_tile[*op.a_slice.as_slices()]
+        b_view = b_tile[*op.b_slice.as_slices()]
+
+        if not compute_streams:
+            prod = torch.mm(a_view, b_view)
+            accum_fut = dt.accumulate_tile(
+                c,
+                op.c_idx,
+                prod,
+                slice_=op.c_slice,
+            )
+        else:
+            op_stream = compute_streams[op_idx % len(compute_streams)]
+            with torch.cuda.stream(op_stream):
+                prod = torch.mm(a_view, b_view)
+                accum_fut = dt.accumulate_tile(
+                    c,
+                    op.c_idx,
+                    prod,
+                    slice_=op.c_slice,
+                )
+
+        outstanding_accumulates.append((accum_fut, op.a_idx, prod))
+
+        a_remaining[op.a_idx] -= 1
+        _evict_a_if_dead(op.a_idx)
+
+        # Bound in-flight accumulate buffers.
+        while len(outstanding_accumulates) > max_outstanding_accumulates:
+            oldest_fut, oldest_a_idx, _oldest_prod = outstanding_accumulates.popleft()
+            oldest_fut.wait()
+            _evict_a_if_dead(oldest_a_idx)
+
+    # Drain all in-flight accumulates.
+    while outstanding_accumulates:
+        fut, a_idx, _prod = outstanding_accumulates.popleft()
+        fut.wait()
+        _evict_a_if_dead(a_idx)
+
+    # Drain any prefetched requests that were never consumed.
+    for idx, future in a_tile_requests.items():
+        tile = future.get()
+        if release_remote_tiles:
+            dt.release_tile(tile)
+
+    if c.device.type == "cuda":
+        for stream in compute_streams:
+            stream.synchronize()
+        torch.cuda.current_stream().synchronize()
+
+
 def execute_stationary_b(
     a: DTensor,
     b: DTensor,
@@ -210,12 +377,17 @@ def execute_stationary_b(
     *,
     local_only: bool = True,
     release_remote_tiles: bool = True,
+    use_async: bool | None = None,
+    max_outstanding_prefetch: int = 1,
+    max_outstanding_accumulates: int = 4,
+    num_compute_streams: int = 2,
 ) -> list[MultiplyOp]:
     """
     Build and execute a Stationary-B plan.
     Returns the generated op list for debugging/printing.
     """
     import dtensor_utils as dt  # Lazy import to avoid circular import at module import time.
+    import os
 
     c_rep_factor = dt.replication_factor(c)
     if c_rep_factor > 1 and dt.my_replica(c) != 0:
@@ -224,13 +396,27 @@ def execute_stationary_b(
         c.to_local().zero_()
 
     ops = build_stationary_b_ops(a, b, c, local_only=local_only)
-    execute_stationary_b_ops(
-        a,
-        b,
-        c,
-        ops,
-        release_remote_tiles=release_remote_tiles,
-    )
+    if use_async is None:
+        use_async = True
+    if use_async:
+        execute_stationary_b_ops_async(
+            a,
+            b,
+            c,
+            ops,
+            release_remote_tiles=release_remote_tiles,
+            max_outstanding_prefetch=max_outstanding_prefetch,
+            max_outstanding_accumulates=max_outstanding_accumulates,
+            num_compute_streams=num_compute_streams,
+        )
+    else:
+        execute_stationary_b_ops(
+            a,
+            b,
+            c,
+            ops,
+            release_remote_tiles=release_remote_tiles,
+        )
 
     if c_rep_factor > 1:
         # Ensure all ranks finish local compute before one-sided reduction.
