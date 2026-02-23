@@ -29,6 +29,17 @@ _tile_heap: NvshmemHeap | None = None
 _tile_heap_dtype: torch.dtype | None = None
 _tile_heap_device: torch.device | None = None
 _get_tile_async_raw_nvshmem_stream: Stream | None = None
+_peer_tensor_cache: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _free_peer_tensor_cache() -> None:
+    global _peer_tensor_cache
+    for peer in _peer_tensor_cache.values():
+        try:
+            nvshmem.free_tensor(peer)
+        except Exception:
+            pass
+    _peer_tensor_cache.clear()
 
 
 def _get_async_nvshmem_stream() -> Stream:
@@ -77,9 +88,14 @@ def init_scratch(
 
 def free_get_tile_scratch(dt: DTensor | None = None) -> None:
     """
-    Free the NVSHMEM heap (collective).
+    Free all temporary NVSHMEM-backed scratch state (collective).
+
+    This includes:
+      - get_tile scratch heap allocations
+      - cached peer mappings created via nvshmem.get_peer_tensor(...)
     """
     global _tile_heap, _tile_heap_dtype, _tile_heap_device
+    _free_peer_tensor_cache()
     if _tile_heap is None:
         return
     if dt is not None and (dt.dtype != _tile_heap_dtype or dt.device != _tile_heap_device):
@@ -88,6 +104,13 @@ def free_get_tile_scratch(dt: DTensor | None = None) -> None:
     _tile_heap = None
     _tile_heap_dtype = None
     _tile_heap_device = None
+
+
+def clear_peer_tensor_cache() -> None:
+    """
+    Backward-compatible alias for peer mapping cleanup.
+    """
+    _free_peer_tensor_cache()
 
 
 def grid_shape(dt: DTensor) -> tuple[int, int]:
@@ -505,7 +528,12 @@ def accumulate_tile(
                 "(set TORCH_DTENSOR_USE_NVSHMEM=1 before constructing DTensors)"
             )
         try:
-            dst_base = nvshmem.get_peer_tensor(local_base, owner_rank).view(max_shape)
+            cache_key = (int(local_base.data_ptr()), int(owner_rank))
+            dst_base = _peer_tensor_cache.get(cache_key)
+            if dst_base is None:
+                dst_base = nvshmem.get_peer_tensor(local_base, owner_rank)
+                _peer_tensor_cache[cache_key] = dst_base
+            dst_base = dst_base.view(max_shape)
         except Exception as exc:
             raise RuntimeError(
                 "accumulate_tile failed to map remote tile memory with "
