@@ -1,6 +1,7 @@
 import torch
 import torch.distributed as dist
 import time
+from typing import Literal
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
@@ -12,6 +13,8 @@ aten = torch.ops.aten
 comm_issue = 0
 comm_sync = 0
 compute = 0
+StationaryMethod = Literal["auto", "stationary_c", "stationary_b"]
+_stationary_method: StationaryMethod = "auto"
 
 
 def print_stats():
@@ -116,13 +119,17 @@ def _addmm_out_handler(
             f"aten.addmm.out handler shape mismatch: a.shape={tuple(a.shape)}, "
             f"b.shape={tuple(b.shape)}, c.shape={tuple(c.shape)}")
 
-    dt.execute_stationary_b(a, b, c)
-    return
-    # Select Stationary-C unless B is larger than C.
-    if dt.matrix_numel(b) > dt.matrix_numel(c):
+    method = _stationary_method
+    if method == "stationary_b":
         dt.execute_stationary_b(a, b, c)
-    else:
+    elif method == "stationary_c":
         dt.execute_stationary_c(a, b, c)
+    else:
+        # Auto-select Stationary-C unless B is larger than C.
+        if dt.matrix_numel(b) > dt.matrix_numel(c):
+            dt.execute_stationary_b(a, b, c)
+        else:
+            dt.execute_stationary_c(a, b, c)
 
 
 _CUSTOM_OPS = {
@@ -130,10 +137,18 @@ _CUSTOM_OPS = {
 }
 
 
-def enable() -> None:
+def enable(stationary_method: StationaryMethod = "auto") -> None:
+    global _stationary_method
+    if stationary_method not in {"auto", "stationary_c", "stationary_b"}:
+        raise ValueError(
+            "stationary_method must be one of: auto, stationary_c, stationary_b"
+        )
+    _stationary_method = stationary_method
     DTensor._op_dispatcher._custom_op_handlers.update(_CUSTOM_OPS)
 
 
 def disable() -> None:
+    global _stationary_method
+    _stationary_method = "auto"
     for op in _CUSTOM_OPS:
         DTensor._op_dispatcher._custom_op_handlers.pop(op, None)

@@ -52,6 +52,7 @@ def run_matmul_benchmark(
     b_partition: str,
     c_partition: str,
     replication_factor: int,
+    stationary_method: str,
 ):
     # Init pytorch.dist
     dist.init_process_group(backend='nccl')
@@ -72,7 +73,7 @@ def run_matmul_benchmark(
 
     stream = _init_nvshmem(rank, world_size, gpu_id)
 
-    dtensor_mm_handler.enable()
+    dtensor_mm_handler.enable(stationary_method=stationary_method)
 
     a_p = get_partitioning(a_partition, replication_factor)
     b_p = get_partitioning(b_partition, replication_factor)
@@ -193,6 +194,13 @@ def main() -> None:
         default=1,
         help="Replication factor for A, B, and C",
     )
+    parser.add_argument(
+        "--stationary-method",
+        type=str,
+        choices=["auto", "stationary_c", "stationary_b"],
+        default="auto",
+        help="Select stationary execution method used by addmm handler",
+    )
     args = parser.parse_args()
 
     run_matmul_benchmark(
@@ -203,6 +211,7 @@ def main() -> None:
         args.b_partition,
         args.c_partition,
         args.replication,
+        args.stationary_method,
     )
 
 
