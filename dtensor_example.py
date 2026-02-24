@@ -51,7 +51,9 @@ def run_matmul_benchmark(
     a_partition: str,
     b_partition: str,
     c_partition: str,
-    replication_factor: int,
+    a_replication_factor: int,
+    b_replication_factor: int,
+    c_replication_factor: int,
     stationary_method: str,
 ):
     # Init pytorch.dist
@@ -75,9 +77,9 @@ def run_matmul_benchmark(
 
     dtensor_mm_handler.enable(stationary_method=stationary_method)
 
-    a_p = get_partitioning(a_partition, replication_factor)
-    b_p = get_partitioning(b_partition, replication_factor)
-    c_p = get_partitioning(c_partition, replication_factor)
+    a_p = get_partitioning(a_partition, a_replication_factor)
+    b_p = get_partitioning(b_partition, b_replication_factor)
+    c_p = get_partitioning(c_partition, c_replication_factor)
 
     global_a = torch.randn(m, k, dtype=torch.float32, device=device)*50 + 50
     global_b = torch.randn(k, n, dtype=torch.float32, device=device)*50 + 50
@@ -191,8 +193,26 @@ def main() -> None:
     parser.add_argument(
         "--replication",
         type=int,
-        default=1,
-        help="Replication factor for A, B, and C",
+        default=None,
+        help="Replication factor for A, B, and C (default: 1; mutually exclusive with per-matrix replication flags)",
+    )
+    parser.add_argument(
+        "--a-replication",
+        type=int,
+        default=None,
+        help="Replication factor for A (default: 1)",
+    )
+    parser.add_argument(
+        "--b-replication",
+        type=int,
+        default=None,
+        help="Replication factor for B (default: 1)",
+    )
+    parser.add_argument(
+        "--c-replication",
+        type=int,
+        default=None,
+        help="Replication factor for C (default: 1)",
     )
     parser.add_argument(
         "--stationary-method",
@@ -203,6 +223,33 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    has_any_matrix_replication = (
+        args.a_replication is not None
+        or args.b_replication is not None
+        or args.c_replication is not None
+    )
+    if args.replication is not None and has_any_matrix_replication:
+        parser.error(
+            "Cannot pass --replication together with --a-replication/--b-replication/--c-replication."
+        )
+
+    if args.replication is not None:
+        if args.replication <= 0:
+            parser.error("--replication must be >= 1.")
+        a_replication = args.replication
+        b_replication = args.replication
+        c_replication = args.replication
+    else:
+        if (
+            (args.a_replication is not None and args.a_replication <= 0)
+            or (args.b_replication is not None and args.b_replication <= 0)
+            or (args.c_replication is not None and args.c_replication <= 0)
+        ):
+            parser.error("--a-replication/--b-replication/--c-replication must be >= 1.")
+        a_replication = 1 if args.a_replication is None else args.a_replication
+        b_replication = 1 if args.b_replication is None else args.b_replication
+        c_replication = 1 if args.c_replication is None else args.c_replication
+
     run_matmul_benchmark(
         args.m,
         args.n,
@@ -210,7 +257,9 @@ def main() -> None:
         args.a_partition,
         args.b_partition,
         args.c_partition,
-        args.replication,
+        a_replication,
+        b_replication,
+        c_replication,
         args.stationary_method,
     )
 
