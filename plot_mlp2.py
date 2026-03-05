@@ -1,12 +1,25 @@
 import re
 from collections import defaultdict
+from pathlib import Path
 import sys
 import numpy as np
 
 experiments = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(dict))))
 current_experiment = None
 
-for line in sys.stdin:
+
+def _iter_input_lines():
+    # Preserve stdin piping behavior, but default to MLP-2 job logs.
+    if not sys.stdin.isatty():
+        yield from sys.stdin
+        return
+    log_root = Path(__file__).resolve().parent / "jobs" / "mlp2" / "logs" / "commands"
+    for log_path in sorted(log_root.glob("mlp2_chunk_*/cmd_*.log")):
+        with log_path.open("r", encoding="utf-8", errors="replace") as f:
+            yield from f
+
+
+for line in _iter_input_lines():
     line = line.strip()
     m = re.match('mpirun -n (\\d+) .\\/(.+?) (.+?) (.+?) (.+?) (.+?) (.+?) (.+?) (\\d+?) (\\d+?) (\\d+?) (\\d+)', line)
 
@@ -53,6 +66,7 @@ for line in sys.stdin:
             current_experiment = (distribution,algorithm,nprocs,replication_factors,shape)
         elif a_replication_factor == 8 and b_replication_factor == 8:
             current_experiment = None
+            current_experiment = (distribution,algorithm,nprocs,replication_factors,shape)
         else:
             current_experiment = None
             current_experiment = (distribution,algorithm,nprocs,replication_factors,shape)
@@ -96,7 +110,7 @@ for m in batch_sizes:
         for distribution in experiments[nprocs].keys():
             for algorithm in experiments[nprocs][distribution].keys():
                 for replication_factors in experiments[nprocs][distribution][algorithm].keys():
-                    shape_key = (m,49152,12288)
+                    shape_key = (m,12288,49152)
                     if shape_key in experiments[nprocs][distribution][algorithm][replication_factors]:
                         perf = experiments[nprocs][distribution][algorithm][replication_factors][shape_key]
                         data[distribution][algorithm][replication_factors]['gflops'].append(perf)
@@ -145,12 +159,27 @@ for distribution in data.keys():
 
 data_optimized_selected = {}
 
-for distribution in data_optimized.keys():
-    if (data_optimized[distribution]['sc'][0][-1] if data_optimized[distribution]['sc'][0] else 0) > \
-       (data_optimized[distribution]['sb'][0][-1] if data_optimized[distribution]['sb'][0] else 0):
-        data_optimized_selected[distribution] = ('sc', *data_optimized[distribution]['sc'])
+def _last_perf(entry):
+    if not isinstance(entry, tuple) or len(entry) == 0:
+        return None
+    perf_vec = entry[0]
+    if len(perf_vec) == 0:
+        return None
+    return perf_vec[-1]
+
+
+for distribution, alg_map in data_optimized.items():
+    sc_entry = alg_map.get('sc')
+    sb_entry = alg_map.get('sb')
+    sc_last = _last_perf(sc_entry)
+    sb_last = _last_perf(sb_entry)
+
+    if sc_last is None and sb_last is None:
+        continue
+    if sb_last is None or (sc_last is not None and sc_last >= sb_last):
+        data_optimized_selected[distribution] = ('sc', *sc_entry)
     else:
-        data_optimized_selected[distribution] = ('sb', *data_optimized[distribution]['sb'])
+        data_optimized_selected[distribution] = ('sb', *sb_entry)
 
 print(data_optimized_selected)
 
@@ -218,16 +247,15 @@ for idx, (dist, (alg, perf_vec, rf_vec, bs_vec)) in enumerate(sorted(data_optimi
     annotate(ax, xs, ys, rf_vec)
 
 additional_data = [([1024, 2048, 4096, 8192],
-                    [319644.63940534665, 323399.3125891105, 344543.37055557646, 346337.1633676299],
+                    [360374.9629741297, 372261.79504895885, 376807.3233547434, 364240.1579802069],
                     "DT - Row"),
                    ([1024, 2048, 4096, 8192],
-                    [345228.60742313333, 379727.12236284197, 382918.1979303226, 335123.53904613975],
+                    [329301.25882774504, 328863.2102658235, 357041.6856046918, 360297.40168479295],
                     "DT - Column"),
-                    ([1024, 2048, 4096, 8192],
-                     [88364.4, 117819.0, 141383.0, 157092.0],
-                     "COSMA-NCCL")
+                   ([1024, 2048, 4096, 8192],
+                    [123699.0, 176713.0, 235617.0, 282740.0],
+                    "COSMA-NCCL")
                    ]
-
 
 if additional_data is not None:
     for idx,datum in enumerate(additional_data):
@@ -243,7 +271,7 @@ if additional_data is not None:
 # Cosmetics – tweak as you wish
 ax.set_xlabel('Batch Size', fontsize=12)
 ax.set_ylabel('Percent of Peak', fontsize=12)
-ax.set_title(f'{num_tiles}xH100, FP32 GEMM, MLP-1 H=12K', fontsize=14)
+ax.set_title(f'{num_tiles}xH100, FP32 GEMM, MLP-2 H=12K', fontsize=14)
 
 ax.minorticks_off()
 # Use actual batch sizes for x-ticks

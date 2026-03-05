@@ -3,35 +3,21 @@ import torch.distributed as dist
 import time
 from typing import Literal
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Shard
-from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 import dtensor_utils as dt
+import dtensor_profile as profile
 
 
 aten = torch.ops.aten
 
-comm_issue = 0
-comm_sync = 0
-compute = 0
 StationaryMethod = Literal["auto", "stationary_c", "stationary_b"]
 _stationary_method: StationaryMethod = "auto"
 
 
-def print_stats():
-    global comm_issue
-    global comm_sync
-    global compute
-    total = comm_issue + comm_sync + compute
-    print(f'comm_issue: {comm_issue}, comm_sync: {comm_sync}, compute: {compute}')
-    if total > 0:
-        print(f'comm_issue: {100*(comm_issue/total)}%, comm_sync: {100*(comm_sync/total)}%, compute: {100*(compute/total)}')
+def print_stats(runtime_total_s: float | None = None):
+    profile.print_stats(runtime_total_s=runtime_total_s)
 
 def _row_partitioned_matmul_async(a: DTensor, b: DTensor, c: DTensor):
     # a, b, c have already been verified at this point.
-    global comm_issue
-    global comm_sync
-    global compute
-
     for i in range(dt.grid_shape(a)[0]):
         if dist.get_rank() == dt.tile_rank(a, (i, 0)):
             a_tile = dt.tile(a, (i, 0))
@@ -40,7 +26,7 @@ def _row_partitioned_matmul_async(a: DTensor, b: DTensor, c: DTensor):
             begin = time.time()
             b_f = dt.get_tile_async(b, (i, 0))
             end = time.time()
-            comm_issue += end - begin
+            profile.add_comm_issue(end - begin)
 
             for k_ in range(dt.grid_shape(b)[0]):
                 k = (k_ + i) % dt.grid_shape(b)[0]
@@ -48,13 +34,13 @@ def _row_partitioned_matmul_async(a: DTensor, b: DTensor, c: DTensor):
                 begin = time.time()
                 b_tile = b_f.get()
                 end = time.time()
-                comm_sync += end - begin
+                profile.add_comm_sync(end - begin)
 
                 if k_ + 1 < dt.grid_shape(b)[0]:
                     begin = time.time()
                     b_f = dt.get_tile_async(b, ((k + 1) % dt.grid_shape(b)[0], 0))
                     end = time.time()
-                    comm_issue += end - begin
+                    profile.add_comm_issue(end - begin)
 
                 tile_shape = dt.tile_shape(b)
 
@@ -64,15 +50,11 @@ def _row_partitioned_matmul_async(a: DTensor, b: DTensor, c: DTensor):
                 torch.addmm(c_tile, a_view, b_tile, out=c_tile)
                 torch.cuda.current_stream().synchronize()
                 end = time.time()
-                compute += end - begin
+                profile.add_compute(end - begin)
                 dt.release_tile(b_tile)
 
 def _row_partitioned_matmul(a: DTensor, b: DTensor, c: DTensor):
     # a, b, c have already been verified at this point.
-    global comm_issue
-    global comm_sync
-    global compute
-
     for i in range(dt.grid_shape(a)[0]):
         if dist.get_rank() == dt.tile_rank(a, (i, 0)):
             a_tile = dt.tile(a, (i, 0))
@@ -84,7 +66,7 @@ def _row_partitioned_matmul(a: DTensor, b: DTensor, c: DTensor):
                 begin = time.time()
                 b_tile = dt.get_tile(b, (k,0))
                 end = time.time()
-                comm_sync += end - begin
+                profile.add_comm_sync(end - begin)
 
                 tile_shape = dt.tile_shape(b)
 
@@ -94,7 +76,7 @@ def _row_partitioned_matmul(a: DTensor, b: DTensor, c: DTensor):
                 torch.addmm(c_tile, a_view, b_tile, out=c_tile)
                 torch.cuda.current_stream().synchronize()
                 end = time.time()
-                compute += end - begin
+                profile.add_compute(end - begin)
 
 
 def _addmm_out_handler(
@@ -121,8 +103,12 @@ def _addmm_out_handler(
 
     method = _stationary_method
     if method == "stationary_b":
+        if dist.get_rank() == 0:
+            print('Running S-B')
         dt.execute_stationary_b(a, b, c)
     elif method == "stationary_c":
+        if dist.get_rank() == 0:
+            print('Running S-C')
         dt.execute_stationary_c(a, b, c)
     else:
         # Auto-select Stationary-C unless B is larger than C.

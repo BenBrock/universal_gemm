@@ -1,9 +1,11 @@
 from dataclasses import dataclass
+import time
 
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
+import dtensor_profile as profile
 from tile_bounds import Slice1D, Slice2D, overlapping_tiles, tile_bounds
 
 
@@ -217,20 +219,30 @@ def execute_stationary_c_ops(
                 f"owner={owner}, rank={rank}"
             )
 
+        begin = time.time()
         a_tile = dt.get_tile(a, op.a_idx)
+        end = time.time()
+        profile.add_comm_sync(end - begin)
+
+        begin = time.time()
         b_tile = dt.get_tile(b, op.b_idx)
+        end = time.time()
+        profile.add_comm_sync(end - begin)
         c_tile = dt.tile(c, op.c_idx)
 
         a_view = a_tile[*op.a_slice.as_slices()]
         b_view = b_tile[*op.b_slice.as_slices()]
         c_view = c_tile[*op.c_slice.as_slices()]
 
+        begin = time.time()
         torch.addmm(c_view, a_view, b_view, out=c_view)
         # This simple executor reuses pooled scratch tiles from get_tile.
         # Synchronize before the next op so scratch buffers are not
         # overwritten while addmm is still in-flight on the stream.
         if c.device.type == "cuda":
             torch.cuda.current_stream().synchronize()
+        end = time.time()
+        profile.add_compute(end - begin)
 
         if release_remote_tiles:
             dt.release_tile(a_tile)
@@ -272,6 +284,7 @@ def execute_stationary_c_ops_async(
     b_tile_requests: dict[tuple[int, int], object] = {}
     a_tiles: dict[tuple[int, int], torch.Tensor] = {}
     b_tiles: dict[tuple[int, int], torch.Tensor] = {}
+    cuda_compute_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
 
     # Track which requests count against the outstanding prefetch budget.
     prefetched_requests: set[tuple[str, tuple[int, int]]] = set()
@@ -298,7 +311,10 @@ def execute_stationary_c_ops_async(
         if idx in tiles or idx in requests:
             return False
         matrix = a if matrix_name == "a" else b
+        begin = time.time()
         requests[idx] = dt.get_tile_async(matrix, idx)
+        end = time.time()
+        profile.add_comm_issue(end - begin)
         if prefetch:
             prefetched_requests.add((matrix_name, idx))
         return True
@@ -307,14 +323,24 @@ def execute_stationary_c_ops_async(
         requests, tiles = _select_maps(matrix_name)
         future = requests.pop(idx, None)
         if future is not None:
+            begin = time.time()
             tile = future.get()
+            end = time.time()
+            profile.add_comm_sync(end - begin)
             tiles[idx] = tile
         else:
             tile = tiles.get(idx)
             if tile is None:
                 # Required, non-prefetched path.
                 matrix = a if matrix_name == "a" else b
-                tile = dt.get_tile_async(matrix, idx).get()
+                begin = time.time()
+                future = dt.get_tile_async(matrix, idx)
+                end = time.time()
+                profile.add_comm_issue(end - begin)
+                begin = time.time()
+                tile = future.get()
+                end = time.time()
+                profile.add_comm_sync(end - begin)
                 tiles[idx] = tile
         prefetched_requests.discard((matrix_name, idx))
         return tiles[idx]
@@ -347,7 +373,18 @@ def execute_stationary_c_ops_async(
         a_view = a_tile[*op.a_slice.as_slices()]
         b_view = b_tile[*op.b_slice.as_slices()]
         c_view = c_tile[*op.c_slice.as_slices()]
-        torch.addmm(c_view, a_view, b_view, out=c_view)
+        if c.device.type == "cuda":
+            begin_evt = torch.cuda.Event(enable_timing=True)
+            end_evt = torch.cuda.Event(enable_timing=True)
+            begin_evt.record()
+            torch.addmm(c_view, a_view, b_view, out=c_view)
+            end_evt.record()
+            cuda_compute_events.append((begin_evt, end_evt))
+        else:
+            begin = time.time()
+            torch.addmm(c_view, a_view, b_view, out=c_view)
+            end = time.time()
+            profile.add_compute(end - begin)
 
         a_remaining[op.a_idx] -= 1
         if a_remaining[op.a_idx] == 0:
@@ -363,16 +400,24 @@ def execute_stationary_c_ops_async(
 
     # Drain any leftover prefetched requests before returning.
     for idx, future in a_tile_requests.items():
+        begin = time.time()
         tile = future.get()
+        end = time.time()
+        profile.add_comm_sync(end - begin)
         if release_remote_tiles:
             dt.release_tile(tile)
     for idx, future in b_tile_requests.items():
+        begin = time.time()
         tile = future.get()
+        end = time.time()
+        profile.add_comm_sync(end - begin)
         if release_remote_tiles:
             dt.release_tile(tile)
 
     if c.device.type == "cuda":
         torch.cuda.current_stream().synchronize()
+        for begin_evt, end_evt in cuda_compute_events:
+            profile.add_compute(begin_evt.elapsed_time(end_evt) / 1000.0)
 
 
 def execute_stationary_c(

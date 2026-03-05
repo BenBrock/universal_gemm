@@ -111,7 +111,7 @@ def run_matmul_benchmark(
         durations.append(duration)
 
     if rank == 0:
-        dtensor_mm_handler.print_stats()
+        dtensor_mm_handler.print_stats(runtime_total_s=sum(durations))
 
     ref_durations = []
     for i in range(n_iterations):

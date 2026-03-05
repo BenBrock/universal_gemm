@@ -1,10 +1,12 @@
 from stationary_c_plan import MultiplyOp
 from collections import deque
+import time
 
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
+import dtensor_profile as profile
 from tile_bounds import Slice1D, Slice2D, overlapping_tiles, tile_bounds
 
 
@@ -178,19 +180,35 @@ def execute_stationary_b_ops(
                 f"owner={owner}, rank={rank}"
             )
 
+        begin = time.time()
         a_tile = dt.get_tile(a, op.a_idx)
+        end = time.time()
+        profile.add_comm_sync(end - begin)
         b_tile = dt.tile(b, op.b_idx)
 
         a_view = a_tile[*op.a_slice.as_slices()]
         b_view = b_tile[*op.b_slice.as_slices()]
+        begin = time.time()
         prod = torch.mm(a_view, b_view)
+        if c.device.type == "cuda":
+            torch.cuda.current_stream().synchronize()
+        end = time.time()
+        profile.add_compute(end - begin)
 
-        dt.accumulate_tile(
+        begin = time.time()
+        accum_fut = dt.accumulate_tile(
             c,
             op.c_idx,
             prod,
             slice_=op.c_slice,
-        ).wait()
+        )
+        end = time.time()
+        profile.add_comm_issue(end - begin)
+
+        begin = time.time()
+        accum_fut.wait()
+        end = time.time()
+        profile.add_comm_sync(end - begin)
 
         # get_tile uses pooled scratch for remote tiles.
         # Synchronize before releasing/reusing scratch.
@@ -249,7 +267,14 @@ def execute_stationary_b_ops_async(
     prefetched_requests: set[tuple[int, int]] = set()
 
     # Keep outstanding accumulate futures alive with their product buffers.
-    outstanding_accumulates: deque[tuple[object, tuple[int, int], torch.Tensor]] = deque()
+    outstanding_accumulates: deque[
+        tuple[
+            object,
+            tuple[int, int],
+            torch.Tensor,
+            tuple[torch.cuda.Event, torch.cuda.Event] | None,
+        ]
+    ] = deque()
 
     a_remaining: dict[tuple[int, int], int] = {}
     for op in ops:
@@ -262,7 +287,10 @@ def execute_stationary_b_ops_async(
     def _enqueue_a(idx: tuple[int, int], *, prefetch: bool) -> bool:
         if idx in a_tiles or idx in a_tile_requests:
             return False
+        begin = time.time()
         a_tile_requests[idx] = dt.get_tile_async(a, idx)
+        end = time.time()
+        profile.add_comm_issue(end - begin)
         if prefetch:
             prefetched_requests.add(idx)
         return True
@@ -270,7 +298,10 @@ def execute_stationary_b_ops_async(
     def _materialize_a(idx: tuple[int, int]) -> torch.Tensor:
         future = a_tile_requests.pop(idx, None)
         if future is not None:
+            begin = time.time()
             a_tile = future.get()
+            end = time.time()
+            profile.add_comm_sync(end - begin)
             # Remote get_tile_async uses pooled scratch. Clone so cached tiles are
             # independent from scratch reuse while later GEMMs are still in flight.
             if dt.tile_rank(a, idx) != rank:
@@ -279,7 +310,14 @@ def execute_stationary_b_ops_async(
         else:
             a_tile = a_tiles.get(idx)
             if a_tile is None:
-                a_tile = dt.get_tile_async(a, idx).get()
+                begin = time.time()
+                future = dt.get_tile_async(a, idx)
+                end = time.time()
+                profile.add_comm_issue(end - begin)
+                begin = time.time()
+                a_tile = future.get()
+                end = time.time()
+                profile.add_comm_sync(end - begin)
                 if dt.tile_rank(a, idx) != rank:
                     a_tile = a_tile.clone()
                 a_tiles[idx] = a_tile
@@ -296,7 +334,7 @@ def execute_stationary_b_ops_async(
     def _evict_a_if_dead(a_idx: tuple[int, int]) -> None:
         if a_remaining[a_idx] != 0:
             return
-        for _, in_flight_a_idx, _ in outstanding_accumulates:
+        for _, in_flight_a_idx, _, _ in outstanding_accumulates:
             if in_flight_a_idx == a_idx:
                 return
         tile = a_tiles.pop(a_idx, None)
@@ -323,44 +361,85 @@ def execute_stationary_b_ops_async(
         b_view = b_tile[*op.b_slice.as_slices()]
 
         if not compute_streams:
+            begin = time.time()
             prod = torch.mm(a_view, b_view)
+            end = time.time()
+            profile.add_compute(end - begin)
+
+            begin = time.time()
             accum_fut = dt.accumulate_tile(
                 c,
                 op.c_idx,
                 prod,
                 slice_=op.c_slice,
             )
+            end = time.time()
+            profile.add_comm_issue(end - begin)
+            compute_events = None
         else:
             op_stream = compute_streams[op_idx % len(compute_streams)]
+            begin_evt = torch.cuda.Event(enable_timing=True)
+            end_evt = torch.cuda.Event(enable_timing=True)
             with torch.cuda.stream(op_stream):
+                begin_evt.record()
                 prod = torch.mm(a_view, b_view)
+                end_evt.record()
+                begin = time.time()
                 accum_fut = dt.accumulate_tile(
                     c,
                     op.c_idx,
                     prod,
                     slice_=op.c_slice,
                 )
+                end = time.time()
+                profile.add_comm_issue(end - begin)
+            compute_events = (begin_evt, end_evt)
 
-        outstanding_accumulates.append((accum_fut, op.a_idx, prod))
+        outstanding_accumulates.append((accum_fut, op.a_idx, prod, compute_events))
 
         a_remaining[op.a_idx] -= 1
         _evict_a_if_dead(op.a_idx)
 
         # Bound in-flight accumulate buffers.
         while len(outstanding_accumulates) > max_outstanding_accumulates:
-            oldest_fut, oldest_a_idx, _oldest_prod = outstanding_accumulates.popleft()
+            oldest_fut, oldest_a_idx, _oldest_prod, oldest_compute_events = (
+                outstanding_accumulates.popleft()
+            )
+            begin = time.time()
             oldest_fut.wait()
+            end = time.time()
+            wait_duration = end - begin
+            if oldest_compute_events is not None:
+                begin_evt, end_evt = oldest_compute_events
+                compute_duration = begin_evt.elapsed_time(end_evt) / 1000.0
+                profile.add_compute(compute_duration)
+                profile.add_comm_sync(max(wait_duration - compute_duration, 0.0))
+            else:
+                profile.add_comm_sync(wait_duration)
             _evict_a_if_dead(oldest_a_idx)
 
     # Drain all in-flight accumulates.
     while outstanding_accumulates:
-        fut, a_idx, _prod = outstanding_accumulates.popleft()
+        fut, a_idx, _prod, compute_events = outstanding_accumulates.popleft()
+        begin = time.time()
         fut.wait()
+        end = time.time()
+        wait_duration = end - begin
+        if compute_events is not None:
+            begin_evt, end_evt = compute_events
+            compute_duration = begin_evt.elapsed_time(end_evt) / 1000.0
+            profile.add_compute(compute_duration)
+            profile.add_comm_sync(max(wait_duration - compute_duration, 0.0))
+        else:
+            profile.add_comm_sync(wait_duration)
         _evict_a_if_dead(a_idx)
 
     # Drain any prefetched requests that were never consumed.
     for idx, future in a_tile_requests.items():
+        begin = time.time()
         tile = future.get()
+        end = time.time()
+        profile.add_comm_sync(end - begin)
         if release_remote_tiles:
             dt.release_tile(tile)
 
