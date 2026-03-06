@@ -103,12 +103,8 @@ def _addmm_out_handler(
 
     method = _stationary_method
     if method == "stationary_b":
-        if dist.get_rank() == 0:
-            print('Running S-B')
         dt.execute_stationary_b(a, b, c)
     elif method == "stationary_c":
-        if dist.get_rank() == 0:
-            print('Running S-C')
         dt.execute_stationary_c(a, b, c)
     else:
         # Auto-select Stationary-C unless B is larger than C.

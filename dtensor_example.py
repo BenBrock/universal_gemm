@@ -10,7 +10,7 @@ from torch.distributed.tensor import distribute_tensor
 
 import benchmark.util
 import dtensor_utils as dt
-import dtensor_mm_handler
+import dtensor_profile
 import nvshmem.core as nvshmem
 from cuda.core.experimental import Device
 
@@ -44,6 +44,26 @@ def get_partitioning(partition: str, replication_factor: int):
     else:
         raise RuntimeError(f'error: unsupported partitioning {partition}')
 
+
+def _run_stationary_matmul(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    stationary_method: str,
+) -> None:
+    if stationary_method == "stationary_b":
+        dt.execute_stationary_b(a, b, c)
+        return
+    if stationary_method == "stationary_c":
+        dt.execute_stationary_c(a, b, c)
+        return
+
+    # Match the old addmm handler's auto-selection policy.
+    if dt.matrix_numel(b) > dt.matrix_numel(c):
+        dt.execute_stationary_b(a, b, c)
+    else:
+        dt.execute_stationary_c(a, b, c)
+
 def run_matmul_benchmark(
     m: int,
     n: int,
@@ -75,8 +95,6 @@ def run_matmul_benchmark(
 
     stream = _init_nvshmem(rank, world_size, gpu_id)
 
-    dtensor_mm_handler.enable(stationary_method=stationary_method)
-
     a_p = get_partitioning(a_partition, a_replication_factor)
     b_p = get_partitioning(b_partition, b_replication_factor)
     c_p = get_partitioning(c_partition, c_replication_factor)
@@ -102,7 +120,7 @@ def run_matmul_benchmark(
     for i in range(n_iterations):
         dist.barrier()
         begin = time.time()
-        torch.addmm(dt_c, dt_a, dt_b, out=dt_c)
+        _run_stationary_matmul(dt_a, dt_b, dt_c, stationary_method)
         nvshmem.barrier_all(stream=stream)
         torch.cuda.current_stream().synchronize()
         end = time.time()
@@ -111,7 +129,7 @@ def run_matmul_benchmark(
         durations.append(duration)
 
     if rank == 0:
-        dtensor_mm_handler.print_stats(runtime_total_s=sum(durations))
+        dtensor_profile.print_stats(runtime_total_s=sum(durations))
 
     ref_durations = []
     for i in range(n_iterations):
@@ -153,7 +171,6 @@ def run_matmul_benchmark(
     nvshmem.free_tensor(dt_b.nvshmem_base())
     nvshmem.free_tensor(dt_c.nvshmem_base())
     dt.free_get_tile_scratch()
-    dtensor_mm_handler.disable()
 
     # Ensure all ranks complete frees before NVSHMEM finalize.
     dist.barrier()

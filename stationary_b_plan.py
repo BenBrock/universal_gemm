@@ -1,13 +1,21 @@
 from stationary_c_plan import MultiplyOp
 from collections import deque
 import time
+from typing import TypeVar
 
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 import dtensor_profile as profile
 from tile_bounds import Slice1D, Slice2D, overlapping_tiles, tile_bounds
+
+
+T = TypeVar("T")
+
+
+_stationary_b_plan_cache: dict[tuple[object, ...], list[MultiplyOp]] = {}
 
 
 def _format_slice_1d(s: Slice1D) -> str:
@@ -34,25 +42,112 @@ def format_stationary_b_plan(ops: list[MultiplyOp], rank: int | None = None) -> 
     return "\n".join(lines)
 
 
-def _replica_m_range(
+def _placement_key(dt: DTensor) -> tuple[object, ...]:
+    placements: list[tuple[str, int | None]] = []
+    for placement in dt.placements:
+        if isinstance(placement, Shard):
+            placements.append(("Shard", int(placement.dim)))
+        elif isinstance(placement, Replicate):
+            placements.append(("Replicate", None))
+        elif isinstance(placement, Partial):
+            placements.append(("Partial", None))
+        else:
+            raise ValueError(f"Unsupported placement in stationary-B cache key: {placement}")
+    return tuple(placements)
+
+
+def _mesh_key(dt: DTensor) -> tuple[object, ...]:
+    mesh = dt.device_mesh.mesh
+    return (tuple(int(v) for v in mesh.shape), tuple(int(v) for v in mesh.reshape(-1).tolist()))
+
+
+def _stationary_b_cache_key(
+    a: DTensor,
+    b: DTensor,
+    c: DTensor,
+    *,
+    local_only: bool,
+    rank: int,
+) -> tuple[object, ...]:
+    return (
+        local_only,
+        rank,
+        tuple(int(v) for v in a.shape),
+        tuple(int(v) for v in b.shape),
+        tuple(int(v) for v in c.shape),
+        _placement_key(a),
+        _placement_key(b),
+        _placement_key(c),
+        _mesh_key(a),
+        _mesh_key(b),
+        _mesh_key(c),
+    )
+
+
+def clear_stationary_b_plan_cache() -> None:
+    _stationary_b_plan_cache.clear()
+
+
+def _wrapped_replica_m_ranges(
     *,
     m_extent: int,
     rep_factor: int,
     replica_idx: int,
-) -> Slice1D:
-    if m_extent < 0:
-        raise ValueError(f"m_extent must be non-negative, got {m_extent}")
-    if rep_factor <= 0:
-        raise ValueError(f"rep_factor must be positive, got {rep_factor}")
-    if replica_idx < 0 or replica_idx >= rep_factor:
-        raise ValueError(
-            f"replica_idx {replica_idx} out of range for rep_factor {rep_factor}"
-        )
+    tile_sum_idx: int,
+    m_offsets: list[int],
+) -> list[Slice1D]:
+    if m_extent <= 0:
+        return []
+    if not m_offsets:
+        m_offsets = [0]
 
     chunk_size = (m_extent + rep_factor - 1) // rep_factor
-    start = chunk_size * replica_idx
-    stop = min(m_extent, chunk_size * (replica_idx + 1))
-    return Slice1D(start, stop)
+    base_start = chunk_size * replica_idx
+    base_stop = min(m_extent, chunk_size * (replica_idx + 1))
+    base_len = max(base_stop - base_start, 0)
+    if base_len == 0:
+        return []
+
+    offset = m_offsets[tile_sum_idx % len(m_offsets)] % m_extent
+    start = (base_start + offset) % m_extent
+    stop = start + base_len
+    if stop <= m_extent:
+        return [Slice1D(start, stop)]
+    return [Slice1D(start, m_extent), Slice1D(0, stop - m_extent)]
+
+
+def _logical_m_blocks(a: DTensor, c: DTensor) -> list[Slice1D]:
+    import dtensor_utils as dt  # Lazy import to avoid circular import at module import time.
+
+    boundaries = {0, int(c.shape[0])}
+    a_grid_rows, _ = dt.grid_shape(a)
+    c_grid_rows, _ = dt.grid_shape(c)
+
+    for a_row in range(a_grid_rows):
+        bounds = tile_bounds(a, (a_row, 0)).rows
+        boundaries.add(bounds.start)
+        boundaries.add(bounds.stop)
+
+    for c_row in range(c_grid_rows):
+        bounds = tile_bounds(c, (c_row, 0)).rows
+        boundaries.add(bounds.start)
+        boundaries.add(bounds.stop)
+
+    points = sorted(boundaries)
+    return [
+        Slice1D(points[idx], points[idx + 1])
+        for idx in range(len(points) - 1)
+        if points[idx] < points[idx + 1]
+    ]
+
+
+def _rotate_group(items: list[T], offset: int) -> list[T]:
+    if not items:
+        return items
+    start = offset % len(items)
+    if start == 0:
+        return items
+    return items[start:] + items[:start]
 
 
 def build_stationary_b_ops(
@@ -80,17 +175,15 @@ def build_stationary_b_ops(
     import dtensor_utils as dt  # Lazy import to avoid circular import at module import time.
 
     rank = dist.get_rank() if dist.is_initialized() else 0
+    cache_key = _stationary_b_cache_key(a, b, c, local_only=local_only, rank=rank)
+    cached = _stationary_b_plan_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     b_grid_rows, b_grid_cols = dt.grid_shape(b)
     b_rep_factor = dt.replication_factor(b)
     b_replica = dt.my_replica(b)
-
-    global_i_bounds = _replica_m_range(
-        m_extent=int(c.shape[0]),
-        rep_factor=b_rep_factor,
-        replica_idx=b_replica,
-    )
-    if global_i_bounds.size == 0:
-        return []
+    m_offsets = [block.start for block in _logical_m_blocks(a, c)]
 
     ops: list[MultiplyOp] = []
 
@@ -100,43 +193,65 @@ def build_stationary_b_ops(
             if local_only and dt.tile_rank(b, b_idx) != rank:
                 continue
 
+            global_i_ranges = _wrapped_replica_m_ranges(
+                m_extent=int(c.shape[0]),
+                rep_factor=b_rep_factor,
+                replica_idx=b_replica,
+                tile_sum_idx=k + j,
+                m_offsets=m_offsets,
+            )
+            if not global_i_ranges:
+                continue
+
             b_bounds = tile_bounds(b, b_idx)
-            a_region = Slice2D(global_i_bounds, b_bounds.rows)
-            a_tiles = overlapping_tiles(a, a_region)
+            grouped_ops: dict[tuple[int, int], list[MultiplyOp]] = {}
+            group_order: list[tuple[int, int]] = []
 
-            for a_idx in a_tiles:
-                a_bounds = dt.intersect_2d(tile_bounds(a, a_idx), a_region)
-                c_region = Slice2D(a_bounds.rows, b_bounds.cols)
-                c_tiles = overlapping_tiles(c, c_region)
+            for global_i_bounds in global_i_ranges:
+                a_region = Slice2D(global_i_bounds, b_bounds.rows)
+                a_tiles = overlapping_tiles(a, a_region)
 
-                for c_idx in c_tiles:
-                    c_bounds = tile_bounds(c, c_idx)
+                for a_idx in a_tiles:
+                    a_bounds = dt.intersect_2d(tile_bounds(a, a_idx), a_region)
+                    c_region = Slice2D(a_bounds.rows, b_bounds.cols)
+                    c_tiles = overlapping_tiles(c, c_region)
 
-                    m_bounds = dt.intersect_1d(a_bounds.rows, c_bounds.rows)
-                    k_bounds = dt.intersect_1d(a_bounds.cols, b_bounds.rows)
-                    n_bounds = dt.intersect_1d(b_bounds.cols, c_bounds.cols)
+                    for c_idx in c_tiles:
+                        c_bounds = tile_bounds(c, c_idx)
 
-                    global_a = Slice2D(m_bounds, k_bounds)
-                    global_b = Slice2D(k_bounds, n_bounds)
-                    global_c = Slice2D(m_bounds, n_bounds)
+                        m_bounds = dt.intersect_1d(a_bounds.rows, c_bounds.rows)
+                        k_bounds = dt.intersect_1d(a_bounds.cols, b_bounds.rows)
+                        n_bounds = dt.intersect_1d(b_bounds.cols, c_bounds.cols)
 
-                    if global_a.shape[0] == 0 or global_a.shape[1] == 0:
-                        continue
-                    if global_b.shape[0] == 0 or global_b.shape[1] == 0:
-                        continue
-                    if global_c.shape[0] == 0 or global_c.shape[1] == 0:
-                        continue
+                        global_a = Slice2D(m_bounds, k_bounds)
+                        global_b = Slice2D(k_bounds, n_bounds)
+                        global_c = Slice2D(m_bounds, n_bounds)
 
-                    ops.append(
-                        MultiplyOp(
-                            a_idx=a_idx,
-                            b_idx=b_idx,
-                            c_idx=c_idx,
-                            a_slice=dt.subtract_offset(global_a, dt.tile_offset(a, a_idx)),
-                            b_slice=dt.subtract_offset(global_b, dt.tile_offset(b, b_idx)),
-                            c_slice=dt.subtract_offset(global_c, dt.tile_offset(c, c_idx)),
+                        if global_a.shape[0] == 0 or global_a.shape[1] == 0:
+                            continue
+                        if global_b.shape[0] == 0 or global_b.shape[1] == 0:
+                            continue
+                        if global_c.shape[0] == 0 or global_c.shape[1] == 0:
+                            continue
+
+                        key = (m_bounds.start, m_bounds.stop)
+                        if key not in grouped_ops:
+                            grouped_ops[key] = []
+                            group_order.append(key)
+                        grouped_ops[key].append(
+                            MultiplyOp(
+                                a_idx=a_idx,
+                                b_idx=b_idx,
+                                c_idx=c_idx,
+                                a_slice=dt.subtract_offset(global_a, dt.tile_offset(a, a_idx)),
+                                b_slice=dt.subtract_offset(global_b, dt.tile_offset(b, b_idx)),
+                                c_slice=dt.subtract_offset(global_c, dt.tile_offset(c, c_idx)),
+                            )
                         )
-                    )
+
+            for key in group_order:
+                ops.extend(_rotate_group(grouped_ops[key], k + j))
+    _stationary_b_plan_cache[cache_key] = ops
     return ops
 
 

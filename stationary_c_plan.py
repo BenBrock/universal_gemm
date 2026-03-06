@@ -1,12 +1,17 @@
 from dataclasses import dataclass
 import time
+from typing import TypeVar
 
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
 
 import dtensor_profile as profile
 from tile_bounds import Slice1D, Slice2D, overlapping_tiles, tile_bounds
+
+
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -17,6 +22,9 @@ class MultiplyOp:
     a_slice: Slice2D
     b_slice: Slice2D
     c_slice: Slice2D
+
+
+_stationary_c_plan_cache: dict[tuple[object, ...], list[MultiplyOp]] = {}
 
 
 def _format_slice_1d(s: Slice1D) -> str:
@@ -43,13 +51,59 @@ def format_plan(ops: list[MultiplyOp], rank: int | None = None) -> str:
     return "\n".join(lines)
 
 
+def _placement_key(dt: DTensor) -> tuple[object, ...]:
+    placements: list[tuple[str, int | None]] = []
+    for placement in dt.placements:
+        if isinstance(placement, Shard):
+            placements.append(("Shard", int(placement.dim)))
+        elif isinstance(placement, Replicate):
+            placements.append(("Replicate", None))
+        elif isinstance(placement, Partial):
+            placements.append(("Partial", None))
+        else:
+            raise ValueError(f"Unsupported placement in stationary-C cache key: {placement}")
+    return tuple(placements)
+
+
+def _mesh_key(dt: DTensor) -> tuple[object, ...]:
+    mesh = dt.device_mesh.mesh
+    return (tuple(int(v) for v in mesh.shape), tuple(int(v) for v in mesh.reshape(-1).tolist()))
+
+
+def _stationary_c_cache_key(
+    a: DTensor,
+    b: DTensor,
+    c: DTensor,
+    *,
+    local_only: bool,
+    rank: int,
+) -> tuple[object, ...]:
+    return (
+        local_only,
+        rank,
+        tuple(int(v) for v in a.shape),
+        tuple(int(v) for v in b.shape),
+        tuple(int(v) for v in c.shape),
+        _placement_key(a),
+        _placement_key(b),
+        _placement_key(c),
+        _mesh_key(a),
+        _mesh_key(b),
+        _mesh_key(c),
+    )
+
+
+def clear_stationary_c_plan_cache() -> None:
+    _stationary_c_plan_cache.clear()
+
+
 def _rotated_replica_k_ranges(
     *,
     k_extent: int,
     rep_factor: int,
     replica_idx: int,
     tile_sum_idx: int,
-    k_tile_width: int,
+    k_offsets: list[int],
 ) -> list[Slice1D]:
     """
     Return this replica's K ranges for a stationary tile after applying
@@ -59,8 +113,8 @@ def _rotated_replica_k_ranges(
       [chunk_size * replica_idx, min(k_extent, chunk_size * (replica_idx + 1)))
     where chunk_size = ceil(k_extent / rep_factor).
 
-    We then rotate this interval by:
-      offset = (tile_sum_idx * k_tile_width) % k_extent
+    We then rotate this interval by choosing a logical K-block start
+    determined by `tile_sum_idx`.
 
     Rotation is done on a ring [0, k_extent), so the result may wrap and split
     into two ranges.
@@ -73,9 +127,6 @@ def _rotated_replica_k_ranges(
         raise ValueError(
             f"replica_idx {replica_idx} out of range for rep_factor {rep_factor}"
         )
-    if k_tile_width <= 0:
-        raise ValueError(f"k_tile_width must be positive, got {k_tile_width}")
-
     chunk_size = (k_extent + rep_factor - 1) // rep_factor
     base_start = chunk_size * replica_idx
     base_stop = min(k_extent, chunk_size * (replica_idx + 1))
@@ -83,12 +134,49 @@ def _rotated_replica_k_ranges(
     if base_len == 0:
         return []
 
-    offset = (tile_sum_idx * k_tile_width) % k_extent
+    if not k_offsets:
+        k_offsets = [0]
+
+    offset = k_offsets[tile_sum_idx % len(k_offsets)] % k_extent
     start = (base_start + offset) % k_extent
     stop = start + base_len
     if stop <= k_extent:
         return [Slice1D(start, stop)]
     return [Slice1D(start, k_extent), Slice1D(0, stop - k_extent)]
+
+
+def _logical_k_blocks(a: DTensor, b: DTensor) -> list[Slice1D]:
+    import dtensor_utils as dt  # Lazy import to avoid circular import at module import time.
+
+    boundaries = {0, int(a.shape[1])}
+    _, a_grid_cols = dt.grid_shape(a)
+    b_grid_rows, _ = dt.grid_shape(b)
+
+    for a_col in range(a_grid_cols):
+        bounds = tile_bounds(a, (0, a_col)).cols
+        boundaries.add(bounds.start)
+        boundaries.add(bounds.stop)
+
+    for b_row in range(b_grid_rows):
+        bounds = tile_bounds(b, (b_row, 0)).rows
+        boundaries.add(bounds.start)
+        boundaries.add(bounds.stop)
+
+    points = sorted(boundaries)
+    return [
+        Slice1D(points[idx], points[idx + 1])
+        for idx in range(len(points) - 1)
+        if points[idx] < points[idx + 1]
+    ]
+
+
+def _rotate_group(items: list[T], offset: int) -> list[T]:
+    if not items:
+        return items
+    start = offset % len(items)
+    if start == 0:
+        return items
+    return items[start:] + items[:start]
 
 
 def build_stationary_c_ops(
@@ -114,12 +202,17 @@ def build_stationary_c_ops(
     import dtensor_utils as dt  # Lazy import to avoid circular import at module import time.
 
     rank = dist.get_rank() if dist.is_initialized() else 0
+    cache_key = _stationary_c_cache_key(a, b, c, local_only=local_only, rank=rank)
+    cached = _stationary_c_plan_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     c_grid_rows, c_grid_cols = dt.grid_shape(c)
     c_rep_factor = dt.replication_factor(c)
     c_replica = dt.my_replica(c)
 
     k_extent = int(a.shape[1])
-    k_tile_width = dt.tile_shape(a)[1]
+    k_offsets = [block.start for block in _logical_k_blocks(a, b)]
 
     ops: list[MultiplyOp] = []
 
@@ -135,8 +228,10 @@ def build_stationary_c_ops(
                 rep_factor=c_rep_factor,
                 replica_idx=c_replica,
                 tile_sum_idx=i + j,
-                k_tile_width=k_tile_width,
+                k_offsets=k_offsets,
             )
+            grouped_ops: dict[tuple[int, int], list[MultiplyOp]] = {}
+            group_order: list[tuple[int, int]] = []
 
             for k_bounds_for_tile in k_ranges:
                 a_region = Slice2D(c_bounds.rows, k_bounds_for_tile)
@@ -167,7 +262,11 @@ def build_stationary_c_ops(
                         if global_c.shape[0] == 0 or global_c.shape[1] == 0:
                             continue
 
-                        ops.append(
+                        key = (k_bounds.start, k_bounds.stop)
+                        if key not in grouped_ops:
+                            grouped_ops[key] = []
+                            group_order.append(key)
+                        grouped_ops[key].append(
                             MultiplyOp(
                                 a_idx=a_idx,
                                 b_idx=b_idx,
@@ -177,6 +276,10 @@ def build_stationary_c_ops(
                                 c_slice=dt.subtract_offset(global_c, dt.tile_offset(c, c_idx)),
                             )
                         )
+
+            for key in group_order:
+                ops.extend(_rotate_group(grouped_ops[key], i + j))
+    _stationary_c_plan_cache[cache_key] = ops
     return ops
 
 
@@ -265,7 +368,7 @@ def execute_stationary_c_ops_async(
     Execute a Stationary-C op list with async A/B tile prefetch.
 
     Notes:
-      - Ops are executed in-order (no iteration offset).
+      - Ops are assumed to have already been ordered during plan generation.
       - Prefetch is bounded by `max_outstanding_prefetch`.
       - Retrieved tiles are cached and evicted after their final use.
     """
